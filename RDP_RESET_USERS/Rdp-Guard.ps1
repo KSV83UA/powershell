@@ -17,8 +17,7 @@ $WhiteList = @(
     'Administrator',
     'администратор',
     'admin',
-    'service-user',
-    'Anna Nizola'
+    'service-user'    
 )
 
 # Минимальный простой отключённой сессии перед завершением

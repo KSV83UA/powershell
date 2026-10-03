@@ -8,6 +8,19 @@
     return @($Items).Count
 }
 
+function Resolve-ConfigRelativePath {
+    param(
+        [string]$Path,
+        [string]$BaseDirectory
+    )
+
+    if (-not $Path -or [System.IO.Path]::IsPathRooted($Path)) {
+        return $Path
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $BaseDirectory $Path))
+}
+
 function Test-RuleUsesLocalPort {
     param(
         $Rule,

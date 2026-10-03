@@ -155,6 +155,9 @@ function Get-WhitelistAddresses {
             $addresses.Add([string]$entry)
         }
     }
+    elseif ($WhitelistFile) {
+        Write-Log "Файл whitelist не найден: $WhitelistFile — адреса из файла не добавлены." 'WARN'
+    }
 
     return @($addresses | Sort-Object -Unique)
 }
@@ -344,11 +347,18 @@ if (-not (Test-Path $ConfigPath)) {
     throw "Файл конфигурации не найден: $ConfigPath"
 }
 
+$ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).ProviderPath
+$configDir = Split-Path -Parent $ConfigPath
 $config = Import-PowerShellDataFile -Path $ConfigPath
 
 $rdpPort = [int]$config.RdpPort
 $prefix = [string]$config.RuleNamePrefix
-$dataDir = [string]$config.DataDirectory
+
+# Относительные пути из конфига считаются от папки с config.psd1
+$dataDir = if ($config.ContainsKey('DataDirectory') -and $config.DataDirectory) { [string]$config.DataDirectory } else { 'data' }
+$dataDir = Resolve-ConfigRelativePath -Path $dataDir -BaseDirectory $configDir
+$whitelistFile = if ($config.ContainsKey('WhitelistFile')) { [string]$config.WhitelistFile } else { '' }
+$whitelistFile = Resolve-ConfigRelativePath -Path $whitelistFile -BaseDirectory $configDir
 $cacheFile = Join-Path $dataDir 'ua-cidr-cache.txt'
 $hashFile = Join-Path $dataDir 'ua-cidr-hash.txt'
 
@@ -378,7 +388,7 @@ if (-not (Test-FirewallPrioritySupported)) {
 
 $whitelist = [string[]]@(Get-WhitelistAddresses `
     -ConfigAddresses @($config.WhitelistAddresses) `
-    -WhitelistFile ([string]$config.WhitelistFile))
+    -WhitelistFile $whitelistFile)
 
 $whitelistInvalid = @($whitelist | Where-Object { -not (Test-ValidRemoteAddress $_) })
 if ((Get-CollectionCount $whitelistInvalid) -gt 0) {

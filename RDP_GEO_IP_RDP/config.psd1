@@ -32,13 +32,14 @@
 
     # Файл whitelist (один адрес/CIDR на строку, строки с # — комментарии)
     # Адреса из файла объединяются с WhitelistAddresses
-    WhitelistFile = 'C:\Script\RDP_GEO_IP_RDP\whitelist.txt'
+    # Относительный путь считается от папки с config.psd1; можно указать и абсолютный
+    WhitelistFile = 'whitelist.txt'
 
     # Интервал обновления для планировщика (часы)
     UpdateIntervalHours = 24
 
-    # Каталог для логов и кэша списка IP
-    DataDirectory = 'C:\Script\RDP_GEO_IP_RDP\data'
+    # Каталог для логов и кэша списка IP (относительный путь — от папки с config.psd1)
+    DataDirectory = 'data'
 
     # Имя задачи в планировщике Windows
     ScheduledTaskName = 'RDP_GEO_UA_Firewall_Update'

@@ -25,6 +25,7 @@ if (-not (Test-Path $ConfigPath)) {
     throw "Файл конфигурации не найден: $ConfigPath"
 }
 
+$ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).ProviderPath
 $config = Import-PowerShellDataFile -Path $ConfigPath
 $taskName = [string]$config.ScheduledTaskName
 $intervalHours = [int]$config.UpdateIntervalHours

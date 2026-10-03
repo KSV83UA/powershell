@@ -33,6 +33,7 @@
 
 ```powershell
 RdpPort = 3389                    # порт RDP (можно задать другой)
+Protocols = @('TCP', 'UDP')       # протоколы, для которых создаются правила
 UpdateIntervalHours = 24          # интервал автообновления (часы)
 DisableDefaultRdpRules = $true    # отключить встроенные правила RDP
 BlockNonGeoRdp = $true            # блокировать RDP с остальных IP
@@ -50,7 +51,9 @@ BlockNonGeoRdp = $true            # блокировать RDP с остальн
 
 ### 2. Первый запуск
 
-Откройте PowerShell **от имени администратора**:
+Папку со скриптами можно разместить на любом диске — пути к `whitelist.txt` и `data\` считаются от папки с `config.psd1`.
+
+Откройте PowerShell **от имени администратора** и перейдите в папку со скриптами (ниже для примера `C:\Script\RDP_GEO_IP_RDP`):
 
 ```powershell
 cd C:\Script\RDP_GEO_IP_RDP
@@ -71,10 +74,10 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 1. Скрипт скачивает актуальный список CIDR-блоков Украины с [ipdeny.com](https://www.ipdeny.com/ipblocks/data/aggregated/ua-aggregated.zone).
 2. Объединяет его с адресами из `whitelist.txt` и `config.psd1`.
 3. Сравнивает хеш списка с кэшем — если ничего не изменилось, firewall не трогает.
-4. При изменениях удаляет старые управляемые правила и создаёт новые:
-   - `RDP_GEO_UA_WHITELIST` — allow для whitelist (высший приоритет)
-   - `RDP_GEO_UA_001`, `_002`, … — allow для geo-зоны Украины
-   - `RDP_GEO_UA_BLOCK_NON_GEO` — block для остальных IP на порту RDP
+4. При изменениях удаляет старые управляемые правила и создаёт новые — отдельный набор для каждого протокола из `Protocols` (по умолчанию TCP и UDP):
+   - `RDP_GEO_UA_WHITELIST_TCP`, `RDP_GEO_UA_WHITELIST_UDP` — allow для whitelist (высший приоритет)
+   - `RDP_GEO_UA_TCP_001`, `_002`, … и `RDP_GEO_UA_UDP_001`, `_002`, … — allow для geo-зоны Украины
+   - `RDP_GEO_UA_BLOCK_NON_GEO_TCP`, `RDP_GEO_UA_BLOCK_NON_GEO_UDP` — block для остальных IP на порту RDP
 5. Отключает встроенные правила RDP (по системному имени `RemoteDesktop*` и по порту — **работает на любой локали Windows**, в т.ч. украинской).
 
 ### Лимит IP на одно правило
@@ -86,7 +89,7 @@ Windows ограничивает количество адресов в одно
 | Windows 10 / Server до 2022 | 1000 |
 | Windows 11 / Server 2022+ | 10000 |
 
-Для Украины (~2656 CIDR) на старых системах создаётся **3 allow-правила**. Лимит настраивается в `MaxAddressesPerRule` (`0` = автоопределение).
+Для Украины (~2656 CIDR) на старых системах создаётся **3 allow-правила на каждый протокол** (6 при TCP и UDP). Лимит настраивается в `MaxAddressesPerRule` (`0` = автоопределение).
 
 ## Настройки config.psd1
 
@@ -101,9 +104,9 @@ Windows ограничивает количество адресов в одно
 | `DisableDefaultRdpRules` | Отключить встроенные правила RDP | `$true` |
 | `BlockNonGeoRdp` | Блокировать RDP с остальных IP | `$true` |
 | `WhitelistAddresses` | IP/CIDR в конфиге | пусто |
-| `WhitelistFile` | Путь к файлу whitelist | `whitelist.txt` |
+| `WhitelistFile` | Путь к файлу whitelist (относительный — от папки с `config.psd1`) | `whitelist.txt` |
 | `UpdateIntervalHours` | Интервал планировщика (часы) | `24` |
-| `DataDirectory` | Каталог логов и кэша | `data\` |
+| `DataDirectory` | Каталог логов и кэша (относительный — от папки с `config.psd1`) | `data` |
 | `ScheduledTaskName` | Имя задачи планировщика | `RDP_GEO_UA_Firewall_Update` |
 
 ## Whitelist (офис, VPN)
@@ -139,8 +142,8 @@ Start-ScheduledTask -TaskName 'RDP_GEO_UA_Firewall_Update'
 # Просмотр созданных правил
 Get-NetFirewallRule -DisplayName 'RDP_GEO_UA*' | Format-Table DisplayName, Enabled, Action
 
-# Просмотр лога
-Get-Content C:\Script\RDP_GEO_IP_RDP\data\update.log -Tail 30
+# Просмотр лога (из папки со скриптами)
+Get-Content .\data\update.log -Tail 30
 
 # Удаление правил и задачи
 .\Uninstall-RdpGeoFirewall.ps1
@@ -175,9 +178,12 @@ cd C:\Script\RDP_GEO_IP_RDP
 |----------|---------|
 | `Access is denied` | Запустите PowerShell от администратора |
 | `ExecutionPolicy` блокирует скрипт | `Set-ExecutionPolicy -Scope Process Bypass` |
+| «Файл … не имеет цифровой подписи» | Файлы скачаны из интернета: `Unblock-File .\*.ps1` или `Set-ExecutionPolicy -Scope Process Bypass` |
+| Нет правил для UDP | Обновите `Update-RdpGeoFirewall.ps1` и проверьте, что в `Protocols` есть `'UDP'`; старые правила без `_TCP`/`_UDP` в имени удалятся при следующем запуске |
 | `Unexpected token` / кракозябры в ошибке | Файл сохранён без BOM — пересохраните в UTF-8 с BOM |
 | Старые правила RDP не отключились | Запустите `.\Update-RdpGeoFirewall.ps1 -Force` — поиск правил теперь по имени `RemoteDesktop*` и порту, не по английскому DisplayName |
 | `Priority` parameter not found | Нормально для старых Windows — скрипт работает без block-правила |
+| В логе `Файл whitelist не найден` | Проверьте `WhitelistFile` в `config.psd1` — путь должен вести к существующему файлу (относительный считается от папки с конфигом) |
 | Не могу подключиться по RDP | Проверьте whitelist, убедитесь что ваш IP в списке; проверьте правила в `wf.msc` |
 | Скрипт не обновляет правила | Список не изменился — используйте `-Force` |
 | Ошибка загрузки geo-списка | Проверьте интернет и доступность ipdeny.com |

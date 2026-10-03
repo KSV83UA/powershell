@@ -2,6 +2,9 @@
     # Порт RDP (по умолчанию 3389)
     RdpPort = 3389
 
+    # Протоколы, для которых создаются правила (RDP использует TCP и UDP)
+    Protocols = @('TCP', 'UDP')
+
     # Код страны для geo-списка (ISO 3166-1 alpha-2)
     CountryCode = 'UA'
 

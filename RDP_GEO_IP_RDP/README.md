@@ -93,6 +93,7 @@ Windows ограничивает количество адресов в одно
 | Параметр | Описание | По умолчанию |
 |----------|----------|--------------|
 | `RdpPort` | Порт RDP | `3389` |
+| `Protocols` | Протоколы правил (`TCP`, `UDP`) | `TCP`, `UDP` |
 | `CountryCode` | Код страны (для справки) | `UA` |
 | `IpSourceUrl` | URL geo-списка CIDR | ipdeny aggregated UA |
 | `RuleNamePrefix` | Префикс имён правил firewall | `RDP_GEO_UA` |

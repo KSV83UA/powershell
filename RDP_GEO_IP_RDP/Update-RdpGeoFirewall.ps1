@@ -232,7 +232,8 @@ function New-WhitelistAllowRules {
         [string]$Prefix,
         [int]$Port,
         [string[]]$Addresses,
-        [int]$MaxPerRule
+        [int]$MaxPerRule,
+        [string[]]$Protocols = @('TCP', 'UDP')
     )
 
     $Addresses = [string[]]@($Addresses)
@@ -240,31 +241,33 @@ function New-WhitelistAllowRules {
         return
     }
 
-    $chunkIndex = 1
-    foreach ($chunk in @(Split-IntoChunks -Items $Addresses -ChunkSize $MaxPerRule)) {
-        $displayName = if ((Get-CollectionCount $Addresses) -le $MaxPerRule) {
-            "${Prefix}_WHITELIST"
-        }
-        else {
-            '{0}_WHITELIST_{1:D3}' -f $Prefix, $chunkIndex
-        }
+    foreach ($proto in $Protocols) {
+        $chunkIndex = 1
+        foreach ($chunk in @(Split-IntoChunks -Items $Addresses -ChunkSize $MaxPerRule)) {
+            $displayName = if ((Get-CollectionCount $Addresses) -le $MaxPerRule) {
+                "${Prefix}_WHITELIST_${proto}"
+            }
+            else {
+                '{0}_WHITELIST_{1}_{2:D3}' -f $Prefix, $proto, $chunkIndex
+            }
 
-        Write-Log ("Создание whitelist-правила '$displayName' ({0} адресов)" -f (Get-CollectionCount $chunk))
+            Write-Log ("Создание whitelist-правила '$displayName' ({0} адресов)" -f (Get-CollectionCount $chunk))
 
-        New-ManagedFirewallRule @{
-            DisplayName  = $displayName
-            Description  = 'RDP access from whitelist (office/VPN, managed by Update-RdpGeoFirewall.ps1)'
-            Direction    = 'Inbound'
-            Action       = 'Allow'
-            Enabled      = 'True'
-            Profile      = 'Any'
-            Protocol     = 'TCP'
-            LocalPort    = $Port
-            RemoteAddress = $chunk
-            Priority     = 10 + $chunkIndex
+            New-ManagedFirewallRule @{
+                DisplayName  = $displayName
+                Description  = "RDP ($proto) access from whitelist (office/VPN, managed by Update-RdpGeoFirewall.ps1)"
+                Direction    = 'Inbound'
+                Action       = 'Allow'
+                Enabled      = 'True'
+                Profile      = 'Any'
+                Protocol     = $proto
+                LocalPort    = $Port
+                RemoteAddress = $chunk
+                Priority     = 10 + $chunkIndex
+            }
+
+            $chunkIndex++
         }
-
-        $chunkIndex++
     }
 }
 
@@ -274,58 +277,64 @@ function New-GeoAllowRules {
         [int]$Port,
         [string[]]$Blocks,
         [int]$MaxPerRule,
-        [int]$PriorityOffset = 100
+        [int]$PriorityOffset = 100,
+        [string[]]$Protocols = @('TCP', 'UDP')
     )
 
     $Blocks = [string[]]@($Blocks)
-    $chunkIndex = 1
-    foreach ($chunk in @(Split-IntoChunks -Items $Blocks -ChunkSize $MaxPerRule)) {
-        $displayName = '{0}_{1:D3}' -f $Prefix, $chunkIndex
-        Write-Log ("Создание allow-правила '$displayName' ({0} CIDR)" -f (Get-CollectionCount $chunk))
+    foreach ($proto in $Protocols) {
+        $chunkIndex = 1
+        foreach ($chunk in @(Split-IntoChunks -Items $Blocks -ChunkSize $MaxPerRule)) {
+            $displayName = '{0}_{1}_{2:D3}' -f $Prefix, $proto, $chunkIndex
+            Write-Log ("Создание allow-правила '$displayName' ({0} CIDR)" -f (Get-CollectionCount $chunk))
 
-        New-ManagedFirewallRule @{
-            DisplayName   = $displayName
-            Description   = 'RDP access from Ukraine geo zone (managed by Update-RdpGeoFirewall.ps1)'
-            Direction     = 'Inbound'
-            Action        = 'Allow'
-            Enabled       = 'True'
-            Profile       = 'Any'
-            Protocol      = 'TCP'
-            LocalPort     = $Port
-            RemoteAddress = $chunk
-            Priority      = $PriorityOffset + $chunkIndex
+            New-ManagedFirewallRule @{
+                DisplayName   = $displayName
+                Description   = "RDP ($proto) access from Ukraine geo zone (managed by Update-RdpGeoFirewall.ps1)"
+                Direction     = 'Inbound'
+                Action        = 'Allow'
+                Enabled       = 'True'
+                Profile       = 'Any'
+                Protocol      = $proto
+                LocalPort     = $Port
+                RemoteAddress = $chunk
+                Priority      = $PriorityOffset + $chunkIndex
+            }
+
+            $chunkIndex++
         }
-
-        $chunkIndex++
     }
 }
 
 function New-GeoBlockRule {
     param(
         [string]$Prefix,
-        [int]$Port
+        [int]$Port,
+        [string[]]$Protocols = @('TCP', 'UDP')
     )
-
-    $displayName = "${Prefix}_BLOCK_NON_GEO"
 
     if (-not (Test-FirewallPrioritySupported)) {
         Write-Log 'Параметр Priority не поддерживается — block-правило пропущено. Доступ ограничен allow-правилами и отключённым RDP по умолчанию.' 'WARN'
         return
     }
 
-    Write-Log "Создание block-правила '$displayName' для порта $Port"
+    foreach ($proto in $Protocols) {
+        $displayName = "${Prefix}_BLOCK_NON_GEO_${proto}"
 
-    New-ManagedFirewallRule @{
-        DisplayName   = $displayName
-        Description   = 'Block RDP from non-geo addresses (managed by Update-RdpGeoFirewall.ps1)'
-        Direction     = 'Inbound'
-        Action        = 'Block'
-        Enabled       = 'True'
-        Profile       = 'Any'
-        Protocol      = 'TCP'
-        LocalPort     = $Port
-        RemoteAddress = 'Any'
-        Priority      = 50000
+        Write-Log "Создание block-правила '$displayName' для порта $Port"
+
+        New-ManagedFirewallRule @{
+            DisplayName   = $displayName
+            Description   = "Block RDP ($proto) from non-geo addresses (managed by Update-RdpGeoFirewall.ps1)"
+            Direction     = 'Inbound'
+            Action        = 'Block'
+            Enabled       = 'True'
+            Profile       = 'Any'
+            Protocol      = $proto
+            LocalPort     = $Port
+            RemoteAddress = 'Any'
+            Priority      = 50000
+        }
     }
 }
 
@@ -350,8 +359,19 @@ if (-not (Test-Path $dataDir)) {
 $script:LogFile = Join-Path $dataDir 'update.log'
 $maxPerRule = Get-MaxAddressesPerRuleLimit -ConfiguredLimit ([int]$config.MaxAddressesPerRule)
 
+$protocols = if ($config.ContainsKey('Protocols')) {
+    [string[]]@($config.Protocols | ForEach-Object { ([string]$_).ToUpperInvariant() } | Select-Object -Unique)
+}
+else {
+    [string[]]@('TCP', 'UDP')
+}
+$protocolsInvalid = @($protocols | Where-Object { $_ -notin @('TCP', 'UDP') })
+if ((Get-CollectionCount $protocols) -eq 0 -or (Get-CollectionCount $protocolsInvalid) -gt 0) {
+    throw "Некорректное значение Protocols в конфигурации (допустимы TCP и UDP): $($protocols -join ', ')"
+}
+
 Write-Log "=== Запуск обновления RDP geo-firewall ==="
-Write-Log "Порт RDP: $rdpPort, лимит CIDR на правило: $maxPerRule"
+Write-Log "Порт RDP: $rdpPort, протоколы: $($protocols -join ', '), лимит CIDR на правило: $maxPerRule"
 if (-not (Test-FirewallPrioritySupported)) {
     Write-Log 'Priority не поддерживается этой версией Windows — block-правило не будет создано.' 'WARN'
 }
@@ -378,6 +398,8 @@ $hashPayload = @(
     ($whitelist -join "`n")
     'PORT'
     $rdpPort
+    'PROTOCOLS'
+    ($protocols -join ',')
 ) -join "`n"
 
 $newHash = (Get-FileHash -InputStream ([IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($hashPayload))) -Algorithm SHA256).Hash
@@ -395,11 +417,11 @@ Write-Log "Whitelist: $whitelistCount адресов"
 Write-Log "Получено CIDR-блоков: $blocksCount. Потребуется правил: $([Math]::Ceiling($blocksCount / [double]$maxPerRule))"
 
 Remove-ManagedFirewallRules -Prefix $prefix
-New-WhitelistAllowRules -Prefix $prefix -Port $rdpPort -Addresses $whitelist -MaxPerRule $maxPerRule
-New-GeoAllowRules -Prefix $prefix -Port $rdpPort -Blocks $blocks -MaxPerRule $maxPerRule
+New-WhitelistAllowRules -Prefix $prefix -Port $rdpPort -Addresses $whitelist -MaxPerRule $maxPerRule -Protocols $protocols
+New-GeoAllowRules -Prefix $prefix -Port $rdpPort -Blocks $blocks -MaxPerRule $maxPerRule -Protocols $protocols
 
 if ([bool]$config.BlockNonGeoRdp) {
-    New-GeoBlockRule -Prefix $prefix -Port $rdpPort
+    New-GeoBlockRule -Prefix $prefix -Port $rdpPort -Protocols $protocols
 }
 
 if ([bool]$config.DisableDefaultRdpRules) {

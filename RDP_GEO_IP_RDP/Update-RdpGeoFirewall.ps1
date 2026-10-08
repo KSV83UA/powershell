@@ -4,9 +4,9 @@
     Обновляет правила Windows Firewall для доступа к RDP только из geo-зоны Украины.
 
 .DESCRIPTION
-    Загружает актуальный список CIDR-блоков Украины, сравнивает с кэшем
-    и при изменениях пересоздаёт набор правил firewall с учётом лимита
-    адресов на одно правило.
+    Загружает списки адресов Украины из нескольких источников (по регистрации
+    блока и по геолокации), объединяет их, сравнивает с кэшем и при изменениях
+    пересоздаёт набор правил firewall с учётом лимита адресов на одно правило.
 #>
 [CmdletBinding()]
 param(
@@ -65,23 +65,123 @@ function Get-MaxAddressesPerRuleLimit {
     return 1000
 }
 
-function Get-GeoIpBlocks {
-    param([string]$Url)
+function ConvertTo-IpNumber {
+    param([string]$Address)
 
-    Write-Log "Загрузка geo-списка: $Url"
-    $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 120
+    $octets = $Address.Split('.')
+    return ([long]$octets[0] -shl 24) + ([long]$octets[1] -shl 16) + ([long]$octets[2] -shl 8) + [long]$octets[3]
+}
 
-    $blocks = [string[]]@(
-        $response.Content -split '\r?\n' |
-            ForEach-Object { $_.Trim() } |
-            Where-Object { $_ -and $_ -notmatch '^\s*#' }
+function ConvertFrom-IpNumber {
+    param([long]$Number)
+
+    return '{0}.{1}.{2}.{3}' -f (($Number -shr 24) -band 255), (($Number -shr 16) -band 255), (($Number -shr 8) -band 255), ($Number -band 255)
+}
+
+# Скачивает один источник и добавляет его диапазоны (start, end) в $Target.
+#   Cidr     — по строке CIDR (ipdeny: страна по регистрации блока в RIR)
+#   RangeCsv — "start,end,CC" (ip-location-db: страна по геолокации), берутся строки с $CountryCode
+function Add-SourceRanges {
+    param(
+        [hashtable]$Source,
+        [string]$CountryCode,
+        [System.Collections.Generic.List[long[]]]$Target
     )
 
-    if ((Get-CollectionCount $blocks) -eq 0) {
-        throw 'Geo-список пуст или не удалось его разобрать.'
+    if (-not $Source.ContainsKey('Url') -or -not $Source.Url -or -not $Source.ContainsKey('Type')) {
+        throw 'Каждый элемент IpSources должен содержать Type и Url.'
     }
 
-    return [string[]]@($blocks | Sort-Object -Unique)
+    $name = if ($Source.ContainsKey('Name') -and $Source.Name) { [string]$Source.Name } else { [string]$Source.Url }
+
+    Write-Log "Загрузка geo-списка '$name': $($Source.Url)"
+    $content = (Invoke-WebRequest -Uri $Source.Url -UseBasicParsing -TimeoutSec 120).Content
+    $before = $Target.Count
+
+    switch ($Source.Type) {
+        'Cidr' {
+            foreach ($line in ($content -split '\r?\n')) {
+                $cidr = $line.Trim()
+                if (-not $cidr -or $cidr.StartsWith('#')) {
+                    continue
+                }
+
+                if (-not (Test-ValidCidr $cidr)) {
+                    throw "В geo-списке '$name' найден некорректный CIDR: $cidr"
+                }
+
+                $address, $prefix = $cidr.Split('/')
+                $size = [long]1 -shl (32 - [int]$prefix)
+                $start = ConvertTo-IpNumber $address
+                $start -= $start % $size
+                $Target.Add([long[]]@($start, ($start + $size - 1)))
+            }
+        }
+        'RangeCsv' {
+            $pattern = '(?m)^(\d{1,3}(?:\.\d{1,3}){3}),(\d{1,3}(?:\.\d{1,3}){3}),' + $CountryCode + '[ \t\r]*$'
+            foreach ($match in [regex]::Matches($content, $pattern)) {
+                $first = $match.Groups[1].Value
+                $last = $match.Groups[2].Value
+
+                if (-not ((Test-ValidIpv4 $first) -and (Test-ValidIpv4 $last))) {
+                    throw "В geo-списке '$name' найден некорректный диапазон: $($match.Value)"
+                }
+
+                $Target.Add([long[]]@((ConvertTo-IpNumber $first), (ConvertTo-IpNumber $last)))
+            }
+        }
+        default {
+            throw "Неизвестный Type источника '$name': $($Source.Type) (допустимы Cidr и RangeCsv)"
+        }
+    }
+
+    $added = $Target.Count - $before
+    if ($added -eq 0) {
+        throw "Geo-список '$name' пуст или не удалось его разобрать."
+    }
+
+    Write-Log "Источник '$name': $added записей"
+}
+
+# Склеивает пересекающиеся и соседние диапазоны; возвращает "IP" или "start-end" (формат RemoteAddress).
+function Merge-IpRanges {
+    param([System.Collections.Generic.List[long[]]]$Ranges)
+
+    $count = $Ranges.Count
+    $starts = [long[]]::new($count)
+    $ends = [long[]]::new($count)
+    for ($i = 0; $i -lt $count; $i++) {
+        $starts[$i] = $Ranges[$i][0]
+        $ends[$i] = $Ranges[$i][1]
+    }
+    [Array]::Sort($starts, $ends)
+
+    $result = [System.Collections.Generic.List[string]]::new()
+    $curStart = $starts[0]
+    $curEnd = $ends[0]
+
+    for ($i = 1; $i -le $count; $i++) {
+        if ($i -lt $count -and $starts[$i] -le $curEnd + 1) {
+            if ($ends[$i] -gt $curEnd) {
+                $curEnd = $ends[$i]
+            }
+            continue
+        }
+
+        if ($curStart -eq $curEnd) {
+            $result.Add((ConvertFrom-IpNumber $curStart))
+        }
+        else {
+            $result.Add(('{0}-{1}' -f (ConvertFrom-IpNumber $curStart), (ConvertFrom-IpNumber $curEnd)))
+        }
+
+        if ($i -lt $count) {
+            $curStart = $starts[$i]
+            $curEnd = $ends[$i]
+        }
+    }
+
+    return [string[]]$result
 }
 
 function Test-ValidIpv4 {
@@ -289,7 +389,7 @@ function New-GeoAllowRules {
         $chunkIndex = 1
         foreach ($chunk in @(Split-IntoChunks -Items $Blocks -ChunkSize $MaxPerRule)) {
             $displayName = '{0}_{1}_{2:D3}' -f $Prefix, $proto, $chunkIndex
-            Write-Log ("Создание allow-правила '$displayName' ({0} CIDR)" -f (Get-CollectionCount $chunk))
+            Write-Log ("Создание allow-правила '$displayName' ({0} диапазонов)" -f (Get-CollectionCount $chunk))
 
             New-ManagedFirewallRule @{
                 DisplayName   = $displayName
@@ -395,10 +495,33 @@ if ((Get-CollectionCount $whitelistInvalid) -gt 0) {
     throw "В whitelist найдены некорректные адреса: $($whitelistInvalid[0])"
 }
 
-$blocks = [string[]]@(Get-GeoIpBlocks -Url $config.IpSourceUrl)
-$invalid = @($blocks | Where-Object { -not (Test-ValidCidr $_) })
+$countryCode = if ($config.ContainsKey('CountryCode')) { ([string]$config.CountryCode).ToUpperInvariant() } else { 'UA' }
+if ($countryCode -notmatch '^[A-Z]{2}$') {
+    throw "Некорректный CountryCode в конфигурации: $countryCode"
+}
+
+$sources = if ($config.ContainsKey('IpSources') -and $config.IpSources) {
+    @($config.IpSources)
+}
+elseif ($config.ContainsKey('IpSourceUrl') -and $config.IpSourceUrl) {
+    Write-Log 'IpSources не задан — используется только IpSourceUrl (страна по регистрации блока). Часть украинских IP за рубежными провайдерами будет блокироваться.' 'WARN'
+    @(@{ Name = 'IpSourceUrl'; Type = 'Cidr'; Url = [string]$config.IpSourceUrl })
+}
+else {
+    throw 'В конфигурации не задан IpSources.'
+}
+
+# Адрес разрешён, если его считает «своим» хотя бы один источник.
+# Любая ошибка загрузки прерывает скрипт ДО изменения правил — текущие правила остаются как были.
+$allRanges = [System.Collections.Generic.List[long[]]]::new()
+foreach ($source in $sources) {
+    Add-SourceRanges -Source $source -CountryCode $countryCode -Target $allRanges
+}
+
+$blocks = [string[]]@(Merge-IpRanges -Ranges $allRanges)
+$invalid = @($blocks | Where-Object { -not (Test-ValidRemoteAddress $_) })
 if ((Get-CollectionCount $invalid) -gt 0) {
-    throw "В geo-списке найдены некорректные CIDR: $($invalid[0])"
+    throw "В объединённом geo-списке найден некорректный адрес: $($invalid[0])"
 }
 
 $hashPayload = @(
@@ -424,7 +547,7 @@ $whitelistCount = Get-CollectionCount $whitelist
 $blocksCount = Get-CollectionCount $blocks
 
 Write-Log "Whitelist: $whitelistCount адресов"
-Write-Log "Получено CIDR-блоков: $blocksCount. Потребуется правил: $([Math]::Ceiling($blocksCount / [double]$maxPerRule))"
+Write-Log "Объединено диапазонов: $blocksCount (из $($allRanges.Count) записей источников). Потребуется правил на протокол: $([Math]::Ceiling($blocksCount / [double]$maxPerRule))"
 
 Remove-ManagedFirewallRules -Prefix $prefix
 New-WhitelistAllowRules -Prefix $prefix -Port $rdpPort -Addresses $whitelist -MaxPerRule $maxPerRule -Protocols $protocols

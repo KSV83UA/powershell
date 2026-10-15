@@ -1,0 +1,2 @@
+# Логины и пароли, которые создаёт UserProfileMove/New-ServerUsers.ps1
+New-ServerUsers.passwords_*.csv

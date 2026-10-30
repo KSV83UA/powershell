@@ -40,15 +40,16 @@
     Длина пароля, от 8 до 64 символов. По умолчанию 12.
 
 .PARAMETER PasswordNeverExpires
-    Сделать пароли бессрочными. Без этого ключа срок действия пароля задаёт политика сервера
-    (по умолчанию 42 дня).
+    Срок действия пароля не ограничен. Включено по умолчанию; с -PasswordNeverExpires:$false
+    срок задаёт политика сервера (по умолчанию 42 дня).
 
 .EXAMPLE
     .\New-ServerUsers.ps1 -WhatIf
     Проверяет список и показывает, кто будет создан, ничего не меняя.
 
 .EXAMPLE
-    .\New-ServerUsers.ps1 -PasswordNeverExpires
+    .\New-ServerUsers.ps1 -PasswordNeverExpires:$false
+    Создаёт пользователей с паролями, срок действия которых задаёт политика сервера.
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
@@ -59,7 +60,7 @@ param(
     [ValidateRange(8, 64)]
     [int]$PasswordLength = 12,
 
-    [switch]$PasswordNeverExpires
+    [switch]$PasswordNeverExpires = $true
 )
 
 $ErrorActionPreference = 'Stop'

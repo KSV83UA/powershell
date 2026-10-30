@@ -26,8 +26,9 @@
     Запускать на самом сервере от имени администратора.
 
 .PARAMETER UserList
-    CSV-файл со списком пользователей (разделитель - точка с запятой). Столбцы Login и FullName
-    обязательны; остальные - по желанию:
+    CSV-файл со списком пользователей (разделитель - точка с запятой). Столбец Login обязателен;
+    остальные - по желанию:
+      FullName                - ФИО; пусто - учётная запись создаётся без него;
       Password                - готовый пароль; пусто - пароль будет сгенерирован;
       Description             - описание учётной записи; пусто - составляется из Department и Position;
       Department, Position, Phone.
@@ -76,10 +77,8 @@ $lines = @($text -split "`r?`n" | Where-Object { $_ -match '[^\s;,]' })
 if ($lines.Count -lt 2) { throw "В файле $UserList нет ни одной записи." }
 $delimiter = if ($lines[0].Contains(';')) { ';' } else { ',' }
 $rows = @($lines | ConvertFrom-Csv -Delimiter $delimiter)
-foreach ($column in 'Login', 'FullName') {
-    if (@($rows[0].PSObject.Properties.Name) -notcontains $column) {
-        throw "В файле $UserList нет столбца $column. Первая строка должна быть: Login;FullName;Department;Position;Phone"
-    }
+if (@($rows[0].PSObject.Properties.Name) -notcontains 'Login') {
+    throw "В файле $UserList нет столбца Login. Первая строка должна быть: Login;FullName;Department;Position;Phone"
 }
 
 # --- Проверка списка: собираем все ошибки сразу ---
@@ -106,7 +105,6 @@ $users = @(foreach ($row in $rows) {
         }
         elseif ($seen.ContainsKey($login)) { $problems.Add("${where}: такой Login уже есть в списке") }
         else { $seen[$login] = $true }
-        if (-not $fullName) { $problems.Add("${where}: не задано FullName") }
         if ($description.Length -gt 48) {
             $problems.Add("${where}: описание (Description или Department и Position) длиннее 48 символов - столько вмещает учётная запись")
         }
@@ -186,7 +184,7 @@ $results = foreach ($user in $users) {
     if (Get-LocalUser -Name $user.Login -ErrorAction SilentlyContinue) {
         $status = 'уже существует - не изменён'
     }
-    elseif ($PSCmdlet.ShouldProcess($user.Login, "создать учётную запись ($($user.FullName))")) {
+    elseif ($PSCmdlet.ShouldProcess($user.Login, "создать учётную запись$(if ($user.FullName) { " ($($user.FullName))" })")) {
         $password = $user.Password
         if (-not $password) { $password = New-Password $PasswordLength $user.Login }
         $record = [pscustomobject]@{ Login = $user.Login; FullName = $user.FullName; Phone = $user.Phone; Password = $password }
@@ -206,9 +204,9 @@ $results = foreach ($user in $users) {
         try {
             $account = @{
                 Name     = $user.Login
-                FullName = $user.FullName
                 Password = ConvertTo-SecureString $password -AsPlainText -Force
             }
+            if ($user.FullName) { $account.FullName = $user.FullName }
             if ($user.Description) { $account.Description = $user.Description }
             if ($PasswordNeverExpires) { $account.PasswordNeverExpires = $true }
             New-LocalUser @account | Out-Null

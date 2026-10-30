@@ -1,2 +1,6 @@
 # Логины и пароли, которые создаёт UserProfileMove/New-ServerUsers.ps1
 New-ServerUsers.passwords_*.csv
+# Рабочий список пользователей: настоящие пароли и телефоны, а репозиторий публичный
+UserProfileMove/New-ServerUsers.users.csv
+# Рабочие копии Claude Code
+**/.claude/worktrees/

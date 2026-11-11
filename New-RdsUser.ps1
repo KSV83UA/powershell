@@ -1,4 +1,4 @@
-﻿<#
+<#
   Створює локального користувача на RDP-сервері:
    - питає ім'я, прізвище, телефон
    - транслітерує (офіційна українська, КМУ 2010; російські літери теж обробляються)
@@ -117,6 +117,15 @@ function Add-PasswordLine {
     [IO.File]::AppendAllText($Path, $prefix + $line + "`r`n", $enc)
 }
 
+# --- додавання в локальну групу ---
+# net.exe звертається до групи напряму за іменем, тому працює навіть тоді,
+# коли Add-LocalGroupMember / Get-LocalGroup не бачать групу через збій переліку груп у SAM.
+function Add-ToLocalGroup {
+    param([string]$Group, [string]$Member)
+    cmd.exe /c "net.exe localgroup `"$Group`" `"$Member`" /add >nul 2>&1"
+    if ($LASTEXITCODE -ne 0) { throw "Не вдалося додати $Member до групи '$Group' (net localgroup, код $LASTEXITCODE)." }
+}
+
 # ================== основний цикл ==================
 $rdpGroup   = (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-555')).Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
 $usersGroup = (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')).Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
@@ -149,8 +158,8 @@ do {
     try {
         $sec = ConvertTo-SecureString $password -AsPlainText -Force
         New-LocalUser -Name $login -FullName $fullName -Password $sec -PasswordNeverExpires -AccountNeverExpires | Out-Null
-        Add-LocalGroupMember -Group $usersGroup -Member $login -ErrorAction SilentlyContinue
-        Add-LocalGroupMember -Group $rdpGroup   -Member $login
+        Add-ToLocalGroup -Group $usersGroup -Member $login
+        Add-ToLocalGroup -Group $rdpGroup   -Member $login
     }
     catch {
         Write-Host "Помилка створення: $($_.Exception.Message)" -ForegroundColor Red

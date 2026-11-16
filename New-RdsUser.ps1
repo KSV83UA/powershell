@@ -1,4 +1,4 @@
-<#
+﻿<#
   Створює локального користувача на RDP-сервері:
    - питає ім'я, прізвище, телефон
    - транслітерує (офіційна українська, КМУ 2010; російські літери теж обробляються)
@@ -130,6 +130,9 @@ function Add-ToLocalGroup {
 $rdpGroup   = (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-555')).Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
 $usersGroup = (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')).Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
 
+# continue у do-while одразу перевіряє умову циклу, тому $more має бути 'y' вже на першому проході,
+# інакше помилка введення для першого користувача мовчки завершує скрипт
+$more = 'y'
 do {
     Write-Host ''
     $first = (Read-Host "Ім'я").Trim()

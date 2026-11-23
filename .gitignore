@@ -2,5 +2,12 @@
 New-ServerUsers.passwords_*.csv
 # Рабочий список пользователей: настоящие пароли и телефоны, а репозиторий публичный
 UserProfileMove/New-ServerUsers.users.csv
+# ShutdownServers: настоящее описание инфраструктуры (адреса, логины), учётные данные,
+# ключи SSH серверов и логи — только локально, в репозитории лишь infrastructure.example.psd1
+ShutdownServers/infrastructure.psd1
+ShutdownServers/*.cred.xml
+ShutdownServers/known_hosts
+ShutdownServers/keys/
+ShutdownServers/logs/
 # Рабочие копии Claude Code
 **/.claude/worktrees/

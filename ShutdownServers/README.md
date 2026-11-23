@@ -1,0 +1,174 @@
+# Выключение серверов (Windows и Linux)
+
+Один скрипт выключает все серверы по описанию инфраструктуры в `infrastructure.psd1`, **очередями**: сначала терминальные серверы и приложения, потом базы данных, в конце хранилища и гипервизоры. Следующая очередь начинается, когда предыдущая перестала отвечать. Подходит для ручного запуска и для автоматического — из ПО ИБП или планировщика при пропадании питания.
+
+## Состав
+
+| Файл | Назначение |
+|------|------------|
+| `Stop-Servers.ps1` | Выключение, проверка, план, описание инфраструктуры |
+| `infrastructure.example.psd1` | Пример описания инфраструктуры с комментариями ко всем параметрам |
+| `infrastructure.psd1` | **Ваше** описание (создаётся из примера, в git не попадает) |
+| `windows.cred.xml` | Учётные данные администратора Windows, зашифрованы DPAPI (создаётся `-SaveCredential`) |
+| `known_hosts` | Ключи SSH серверов, запоминаются при первом подключении |
+| `logs\` | Логи, по файлу на день |
+
+`infrastructure.psd1`, `*.cred.xml`, `known_hosts`, `keys\` и `logs\` перечислены в `.gitignore`: репозиторий публичный, а в них адреса, логины и учётные данные.
+
+## Требования
+
+- Windows 10 1809+ / Server 2019+ с клиентом OpenSSH (`ssh.exe`) — для Linux. На старых системах: `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0`
+- PowerShell 5.1+
+- Права администратора на **выключаемых** серверах Windows (локально скрипт администратора не требует)
+
+> **Кодировка:** `.ps1` и `.psd1` сохраняйте в **UTF-8 с BOM**, иначе PowerShell 5.1 испортит кириллицу и выдаст `Unexpected token`.
+
+## Быстрый старт
+
+### 1. Описание инфраструктуры
+
+```powershell
+cd C:\Scripts\ShutdownServers
+Copy-Item .\infrastructure.example.psd1 .\infrastructure.psd1
+notepad .\infrastructure.psd1
+```
+
+Для каждого сервера обязательны `Name`, `Address`, `OS` (`Windows` / `Linux`) и `Stage` (очередь: 1 — первыми). `Role` и `Notes` — описание для людей. Компьютер, на котором запускается скрипт, в список не включайте.
+
+```powershell
+.\Stop-Servers.ps1 -List      # проверить, что описание читается
+```
+
+### 2. Доступ к Linux: SSH-ключ
+
+Скрипт входит только по ключу (`BatchMode=yes`) — пароль он не спросит и не хранит.
+
+```powershell
+ssh-keygen -t ed25519                       # Enter на все вопросы: ключ без пароля
+Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub | ssh admin@192.168.1.21 "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
+```
+
+Если входите не под `root`, разрешите пользователю выключение без пароля (на Linux-сервере):
+
+```bash
+echo 'admin ALL=(root) NOPASSWD: /usr/sbin/shutdown, /sbin/shutdown' | sudo tee /etc/sudoers.d/shutdown
+sudo chmod 440 /etc/sudoers.d/shutdown && sudo visudo -c
+```
+
+Для своей команды (`Command = 'sudo -n /sbin/poweroff'`) в sudoers укажите её.
+
+### 3. Доступ к Windows
+
+**В домене** достаточно запускать скрипт от доменного администратора — `CredentialFile` не нужен.
+
+**В рабочей группе** сохраните учётку администратора серверов:
+
+```powershell
+.\Stop-Servers.ps1 -SaveCredential
+```
+
+Файл расшифрует только тот же пользователь на этом же компьютере — создавайте его под той учётной записью, от которой скрипт будет запускаться. Для сервера с другой учёткой: `Get-Credential | Export-Clixml .\dc.cred.xml` и `CredentialFile = 'dc.cred.xml'` у этого сервера.
+
+На выключаемых серверах Windows (от администратора):
+
+```powershell
+# WMI (способ по умолчанию): правила брандмауэра по системным именам — работает на любом языке Windows
+Enable-NetFirewallRule -Name 'WMI-RPCSS-In-TCP', 'WMI-WINMGMT-In-TCP'
+# Рабочая группа и НЕ встроенный Administrator: без этого UAC режет права локального админа по сети
+New-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System -Name LocalAccountTokenFilterPolicy -Value 1 -PropertyType DWord -Force
+```
+
+Если правил с такими именами нет — включите в `wf.msc` группу «Инструментарий управления Windows (WMI)». Для `Method = 'WinRM'` на сервере нужен `Enable-PSRemoting -Force`, а в рабочей группе на компьютере со скриптом — адрес сервера в `TrustedHosts`.
+
+### 4. Проверка
+
+```powershell
+.\Stop-Servers.ps1 -Check     # ping, порт, вход по ключу, sudo без пароля, права WMI/WinRM — ничего не выключает
+.\Stop-Servers.ps1 -DryRun    # порядок и команды выключения — ничего не выключает
+```
+
+`-Check` при первом подключении запоминает ключи SSH серверов в `known_hosts`. Добейтесь, чтобы все строки были `OK`, — иначе в нужный момент сервер не выключится.
+
+## Выключение
+
+```powershell
+.\Stop-Servers.ps1                       # покажет план и спросит YES
+.\Stop-Servers.ps1 -Stage 1              # только очередь 1
+.\Stop-Servers.ps1 -Name DB1, FILES      # только эти серверы (можно с * и ?)
+.\Stop-Servers.ps1 -Force                # без вопросов — для ИБП и планировщика
+```
+
+Для ПО ИБП (PowerChute, NUT, «выполнить команду при работе от батареи») или задачи планировщика:
+
+```
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Scripts\ShutdownServers\Stop-Servers.ps1 -Force
+```
+
+Запускайте от той учётной записи, под которой настроены SSH-ключ и `windows.cred.xml`. Если ключ лежит не в профиле этого пользователя — укажите путь в `SshKeyFile`. Код возврата: `0` — всё выключено, `1` — были ошибки (подробности в `logs\`).
+
+## Как это работает
+
+1. Серверы с одинаковым `Stage` — одна очередь. Очереди идут по возрастанию номера.
+2. Сервер, который не отвечает ещё до начала, считается выключенным и пропускается.
+3. Каждому серверу очереди отправляется команда выключения:
+   - **Linux** — `ssh` с командой `shutdown -h now` (для `root`) или `sudo -n shutdown -h now`; своя — в `Command`;
+   - **Windows** — `Stop-Computer -Force` по WMI (DCOM) или WinRM; с `Method = 'SSH'` — `shutdown /s /f /t 0` через OpenSSH Server. Сеансы пользователей завершаются принудительно.
+4. Скрипт ждёт, пока все серверы очереди перестанут отвечать (порт управления **и** ping), не дольше `StageTimeoutSec`. Не выключившийся сервер отмечается ошибкой, но скрипт **переходит к следующей очереди** — при отключении питания ждать бесконечно нельзя.
+5. В конце — таблица итогов, всё пишется в `logs\Stop-Servers_ГГГГ-ММ-ДД.log`.
+
+| Способ | Порт, по которому видно, что сервер работает |
+|--------|----------------------------------------------|
+| SSH | `Port` / `SshPort` (22) |
+| WMI | 135 |
+| WinRM | 5985 |
+
+## Параметры infrastructure.psd1
+
+Общие (все необязательные):
+
+| Параметр | Описание | По умолчанию |
+|----------|----------|--------------|
+| `Description` | Описание инфраструктуры, выводится в `-List` | пусто |
+| `StageTimeoutSec` | Сколько ждать выключения одной очереди, сек | `300` |
+| `PollIntervalSec` | Как часто проверять, выключился ли сервер, сек | `5` |
+| `SshUser` | Пользователь SSH | `root` |
+| `SshPort` | Порт SSH | `22` |
+| `SshKeyFile` | Закрытый ключ SSH (пусто — `~\.ssh\id_*`) | пусто |
+| `SshKnownHostsFile` | Файл ключей серверов (пусто — `~\.ssh\known_hosts`) | `known_hosts` |
+| `SshConnectTimeoutSec` | Таймаут подключения SSH, сек | `10` |
+| `WindowsMethod` | Способ для Windows: `WMI` / `WinRM` / `SSH` | `WMI` |
+| `CredentialFile` | Учётные данные Windows (нет файла — права текущего пользователя) | `windows.cred.xml` |
+| `LogDirectory` | Папка логов | `logs` |
+
+Относительные пути — от папки с `infrastructure.psd1`, можно использовать `%USERPROFILE%` и другие переменные окружения.
+
+Сервер (`Servers = @( @{ ... } )`):
+
+| Параметр | Описание |
+|----------|----------|
+| `Name` | **Обязательный.** Имя, уникальное |
+| `Address` | **Обязательный.** IP или DNS-имя |
+| `OS` | **Обязательный.** `Windows` или `Linux` |
+| `Stage` | **Обязательный.** Очередь 1–99, меньше — раньше |
+| `Role`, `Notes` | Описание сервера |
+| `Enabled` | `$false` — описан, но не выключается |
+| `Method` | Переопределить способ (Linux — только `SSH`) |
+| `User`, `Port`, `KeyFile` | Переопределить `SshUser`, `SshPort`, `SshKeyFile`. Для Windows с `Method = 'SSH'` `User` обязателен |
+| `Command` | Своя команда выключения по SSH |
+| `CredentialFile` | Свой файл учётных данных Windows (должен существовать) |
+
+Опечатки в именах параметров, неверные `OS`/`Method`/`Stage` и повторяющиеся имена скрипт находит сразу и перечисляет все одним списком.
+
+## Устранение неполадок
+
+| Проблема | Решение |
+|----------|---------|
+| `Unexpected token` / кракозябры | Файл сохранён без BOM — пересохраните в UTF-8 с BOM |
+| `Permission denied (publickey)` | Ключ не добавлен в `authorized_keys` или скрипт запущен от другого пользователя — укажите `SshKeyFile` |
+| `UNPROTECTED PRIVATE KEY FILE` | Доступ к файлу ключа есть у других пользователей — оставьте права только владельцу (`icacls .\ключ /inheritance:r /grant:r "$($env:USERNAME):R"`) |
+| `sudo не разрешает … без пароля` | Добавьте правило в `/etc/sudoers.d/shutdown` (см. шаг 2) |
+| `REMOTE HOST IDENTIFICATION HAS CHANGED` | Сервер переустановлен — удалите его строку из `known_hosts` |
+| `Access is denied` для WMI | Нет прав администратора на сервере; в рабочей группе — `LocalAccountTokenFilterPolicy` (шаг 3) или учётка не та |
+| `RPC server is unavailable` | Закрыт WMI в брандмауэре сервера (шаг 3) |
+| `не удалось прочитать windows.cred.xml` | Файл создан другим пользователем или на другом компьютере — пересоздайте `-SaveCredential` |
+| `ping есть, но порт закрыт` | Служба SSH/WMI/WinRM не запущена или закрыта брандмауэром |

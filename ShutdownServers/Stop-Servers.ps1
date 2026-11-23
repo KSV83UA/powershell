@@ -33,7 +33,7 @@
 .PARAMETER DryRun
     Показать, какие серверы, в каком порядке и какой командой будут выключены, и выйти.
 .PARAMETER Force
-    Не спрашивать подтверждение.
+    Не спрашивать подтверждение (выключения, а с -SaveCredential -Name — замены общего файла учётных данных).
 .PARAMETER SaveCredential
     Запросить учётные данные администратора Windows и сохранить их: без -Name — в общий CredentialFile,
     с -Name — в CredentialFile этого сервера (сервер не в домене или с другим администратором).
@@ -65,6 +65,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Необработанная ошибка (например, в описании инфраструктуры) — только текст и код возврата 1,
+# без служебного вывода PowerShell, который печатает сообщение дважды
+trap {
+    Write-Log $_.Exception.Message 'ERROR'
+    exit 1
+}
 
 # ======================= общие функции =======================
 
@@ -111,15 +118,135 @@ function Read-ConfigFile {
     # за ANSI и молча портит кириллицу. Здесь годятся UTF-8 (с BOM и без) и ANSI.
     $text = [IO.File]::ReadAllText($Path)
     if ($text.Contains([string][char]0xFFFD)) { $text = [IO.File]::ReadAllText($Path, [Text.Encoding]::Default) }
+    $block = $null
     try {
         $block = [scriptblock]::Create($text)
         # в файле допустимы только данные, без команд и переменных
         $block.CheckRestrictedLanguage([string[]]@(), [string[]]@(), $false)
         $data = & $block
     }
-    catch { throw "Файл конфигурации $Path не читается: $(Get-ErrorText $_)" }
+    catch {
+        # ошибку синтаксиса показываем с номерами и текстом строк, а не одной сплошной строкой
+        for ($e = $_.Exception; $e; $e = $e.InnerException) {
+            if ($e -isnot [System.Management.Automation.ParseException] -or -not $e.Errors) { continue }
+            $restricted = $null -ne $block   # синтаксис верный, но есть команда или переменная
+            $cause = if (-not $restricted) { Find-SyntaxCause -Text $text -Errors $e.Errors }
+            $message = "Ошибка в файле конфигурации $Path"
+            if ($cause) { $message += "`nПохоже: $($cause.Text)" }
+            $message += "`n" + (Format-ParseError -Text $text -Errors $e.Errors -ExtraLine $cause.Line)
+            if ($restricted) { $message += "`nВ файле допустимы только значения: текст в кавычках '...', числа, `$true / `$false — без команд и переменных." }
+            elseif (-not $cause) { $message += "`nОбычно это лишняя или пропущенная скобка ) или }, незакрытая кавычка ' или пропущенный знак =." }
+            throw $message
+        }
+        throw "Файл конфигурации $Path не читается: $(Get-ErrorText $_)"
+    }
     if ($data -isnot [hashtable]) { throw "Файл конфигурации $Path должен содержать одну таблицу @{ ... }." }
     $data
+}
+
+function Find-SyntaxCause {
+    # Настоящее место ошибки: PowerShell часто сообщает о ней строками ниже, там, где заметил.
+    # Возвращает @{ Text; Line } или $null, если причину определить не удалось.
+    param([string]$Text, $Errors)
+    $lines = $Text -split '\r?\n'
+
+    # незакрытая кавычка: всё после неё PowerShell читает как одно значение — ищем строку с нечётным числом кавычек
+    if (@($Errors | Where-Object { $_.ErrorId -like '*Terminator*' }).Count) {
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $line = $lines[$i].Trim()
+            if ($line.StartsWith('#')) { continue }
+            if ((($line.ToCharArray() | Where-Object { $_ -eq [char]"'" }) | Measure-Object).Count % 2) {
+                return [pscustomobject]@{ Text = "строка $($i + 1): не закрыта кавычка ' в значении"; Line = $i + 1 }
+            }
+        }
+        return $null
+    }
+
+    $tokens = $null; $parseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$parseErrors)
+    $pairs = @{ AtCurly = '@{', '}'; AtParen = '@(', ')'; LParen = '(', ')'; LCurly = '{', '}'; DollarParen = '$(', ')' }
+    $brackets = @(foreach ($t in $tokens) {
+        $kind = [string]$t.Kind
+        if ($pairs.ContainsKey($kind)) {
+            [pscustomobject]@{ Open = $true; Text = $pairs[$kind][0]; Close = $pairs[$kind][1]; Line = $t.Extent.StartLineNumber }
+        }
+        elseif ($kind -eq 'RParen' -or $kind -eq 'RCurly') {
+            [pscustomobject]@{ Open = $false; Text = $t.Text; Close = ''; Line = $t.Extent.StartLineNumber }
+        }
+    })
+
+    $p = Test-Brackets -Brackets $brackets -From 0 -Stack @()
+    if (-not $p) { return $null }
+    $t = if ($p.Index -lt $brackets.Count) { $brackets[$p.Index] }
+    switch ($p.Type) {
+        'Nested' {
+            return [pscustomobject]@{ Text = "строка $($p.Top.Line): у блока @{ не хватает закрывающей } — следующий @{ (строка $($t.Line)) начался внутри него"; Line = $p.Top.Line }
+        }
+        'Extra' { return [pscustomobject]@{ Text = "строка $($t.Line): лишняя $($t.Text)"; Line = $t.Line } }
+        'Unclosed' {
+            return [pscustomobject]@{ Text = "строка $($p.Top.Line): у $($p.Top.Text) не хватает закрывающей $($p.Top.Close)"; Line = $p.Top.Line }
+        }
+        'Mismatch' {
+            # лишняя скобка — без неё всё сходится
+            if (-not (Test-Brackets -Brackets $brackets -From ($p.Index + 1) -Stack $p.Stack)) {
+                return [pscustomobject]@{ Text = "строка $($t.Line): лишняя $($t.Text)"; Line = $t.Line }
+            }
+            # пропущенная — если закрыть открытый блок, всё сходится
+            $rest = if ($p.Stack.Count -gt 1) { $p.Stack[0..($p.Stack.Count - 2)] } else { @() }
+            if (-not (Test-Brackets -Brackets $brackets -From $p.Index -Stack $rest)) {
+                return [pscustomobject]@{ Text = "строка $($p.Top.Line): у $($p.Top.Text) не хватает закрывающей $($p.Top.Close) (до строки $($t.Line))"; Line = $p.Top.Line }
+            }
+            return [pscustomobject]@{ Text = "строка $($t.Line): $($t.Text) не подходит к $($p.Top.Text) из строки $($p.Top.Line)"; Line = $t.Line }
+        }
+    }
+}
+
+function Test-Brackets {
+    # Первая проблема со скобками начиная с позиции From при уже открытых Stack; $null — всё сходится
+    param([object[]]$Brackets, [int]$From, [object[]]$Stack)
+    $open = New-Object System.Collections.ArrayList
+    foreach ($s in $Stack) { [void]$open.Add($s) }
+    for ($i = $From; $i -lt $Brackets.Count; $i++) {
+        $b = $Brackets[$i]
+        $top = if ($open.Count) { $open[$open.Count - 1] }
+        if ($b.Open) {
+            # сервер @{ } лежит в Servers = @( ) внутри общей @{ } — глубже таблиц в описании нет
+            if ($b.Text -eq '@{' -and $open.Count -ge 3 -and $top.Text -eq '@{') {
+                return [pscustomobject]@{ Type = 'Nested'; Index = $i; Top = $top; Stack = $open.ToArray() }
+            }
+            [void]$open.Add($b)
+            continue
+        }
+        if (-not $top) { return [pscustomobject]@{ Type = 'Extra'; Index = $i; Top = $null; Stack = @() } }
+        if ($top.Close -ne $b.Text) { return [pscustomobject]@{ Type = 'Mismatch'; Index = $i; Top = $top; Stack = $open.ToArray() } }
+        $open.RemoveAt($open.Count - 1)
+    }
+    if ($open.Count) { return [pscustomobject]@{ Type = 'Unclosed'; Index = $Brackets.Count; Top = $open[$open.Count - 1]; Stack = $open.ToArray() } }
+    $null
+}
+
+function Format-ParseError {
+    param([string]$Text, $Errors, $ExtraLine)
+    $lines = $Text -split '\r?\n'
+    $Errors = @($Errors | Select-Object -First 3)
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($err in $Errors) {
+        $msg = ($err.Message -replace '\s+', ' ').Trim()
+        if ($msg.Length -gt 150) { $msg = $msg.Substring(0, 150) + '…' }
+        $out.Add("  PowerShell: строка $($err.Extent.StartLineNumber), знак $($err.Extent.StartColumnNumber): $msg")
+    }
+    # сами строки с соседними; строки с ошибками помечены >
+    $marked = @(@($Errors | ForEach-Object { $_.Extent.StartLineNumber }) + @($ExtraLine) | Where-Object { $_ })
+    $show = @($marked | ForEach-Object { ($_ - 1)..($_ + 1) } | Where-Object { $_ -ge 1 -and $_ -le $lines.Count } | Sort-Object -Unique)
+    $out.Add('')
+    $prev = 0
+    foreach ($n in $show) {
+        if ($prev -and $n -gt $prev + 1) { $out.Add('         ...') }
+        $mark = if ($marked -contains $n) { '>' } else { ' ' }
+        $out.Add(('  {0} {1,4} | {2}' -f $mark, $n, ($lines[$n - 1] -replace '\t', '    ').TrimEnd()))
+        $prev = $n
+    }
+    $out -join "`n"
 }
 
 function Get-IntValue {
@@ -280,9 +407,14 @@ function Get-WindowsFailureText {
     "$text Вход $(Get-CredentialText $Server), файла $(Split-Path -Leaf $Server.CredentialFile) нет. Сохраните учётку администратора сервера: $save"
 }
 
+function Get-KeyText {
+    param($Server)
+    if ($Server.KeyFile) { "ключ $(Split-Path -Leaf $Server.KeyFile)" } else { 'стандартные ключи ~\.ssh' }
+}
+
 function Get-ActionText {
     param($Server)
-    if ($Server.Method -eq 'SSH') { return "ssh $($Server.User)@$($Server.Address):$($Server.Port) -> $($Server.Command)" }
+    if ($Server.Method -eq 'SSH') { return "ssh $($Server.User)@$($Server.Address):$($Server.Port) ($(Get-KeyText $Server)) -> $($Server.Command)" }
     "Stop-Computer -Force по $($Server.Method), $(Get-CredentialText $Server)"
 }
 
@@ -305,7 +437,7 @@ function Invoke-ServerShutdown {
         }
         # сеанс повис после подключения — обычно это тоже уже идущее выключение; проверим ожиданием
         if ($r.ExitCode -eq -1) { return New-Result $true "ssh не ответил за $timeout с — проверяем, выключается ли сервер" }
-        if ($r.ExitCode -eq 255) { return New-Result $false "не удалось войти по SSH: $err" }
+        if ($r.ExitCode -eq 255) { return New-Result $false "не удалось войти по SSH ($(Get-KeyText $Server)): $err" }
         return New-Result $false "команда '$($Server.Command)' вернула код $($r.ExitCode): $err"
     }
 
@@ -336,8 +468,9 @@ function Test-ServerAccess {
         $probe = if ($usesSudo) { $Server.Command -replace '^\s*sudo\s+(-n\s+)?', 'sudo -n -l ' } else { 'exit 0' }
         $r = Invoke-Ssh -Server $Server -RemoteCommand $probe -TimeoutSec ($script:SshConnectTimeoutSec + 20)
         $err = Get-LastLine $r.Error
-        if ($r.ExitCode -eq 0) { if ($usesSudo) { return New-Result $true 'вход по ключу и sudo без пароля — OK' } else { return New-Result $true 'вход по ключу — OK' } }
-        if ($r.ExitCode -eq 255) { return New-Result $false "вход не удался: $err" }
+        $key = Get-KeyText $Server
+        if ($r.ExitCode -eq 0) { if ($usesSudo) { return New-Result $true "вход по ключу и sudo без пароля — OK ($key)" } else { return New-Result $true "вход по ключу — OK ($key)" } }
+        if ($r.ExitCode -eq 255) { return New-Result $false "вход не удался ($key): $err" }
         if ($r.ExitCode -eq -1) { return New-Result $false $r.Error }
         if ($usesSudo) { return New-Result $false "вход OK, но sudo не разрешает '$($Server.Command)' без пароля: $err" }
         return New-Result $false "вход OK, проверка вернула код $($r.ExitCode): $err"
@@ -550,14 +683,25 @@ if ($SaveCredential) {
         $paths = @($filtered | ForEach-Object CredentialFile | Sort-Object -Unique)
         if ($paths.Count -gt 1) { throw "У $(($filtered | ForEach-Object Name) -join ', ') разные файлы учётных данных — укажите в -Name один сервер." }
         $path = $paths[0]
-        $users = @($servers | Where-Object { $_.Method -ne 'SSH' -and $_.CredentialFile -eq $path })
     }
     else {
         $path = Resolve-ConfigPath ([string]$cfg.CredentialFile) $configDir
         if (-not $path) { throw "CredentialFile в $ConfigPath пуст — некуда сохранять." }
-        $users = @($servers | Where-Object { $_.Method -ne 'SSH' -and -not $_.CredentialExplicit })
     }
+    # все, кто входит по этому файлу, — в том числе серверы, где он указан явно
+    $users = @($servers | Where-Object { $_.Method -ne 'SSH' -and $_.CredentialFile -eq $path })
     $forText = if ($users.Count) { "для $(($users | ForEach-Object Name) -join ', ')" } else { '(пока ни один сервер его не использует)' }
+
+    # -Name, а файл общий с другими серверами: новая учётка достанется и им — частая ошибка при копировании примера
+    $named = @($filtered | ForEach-Object Name)
+    $others = @($users | Where-Object { $named -notcontains $_.Name })
+    if ($Name -and $others.Count -and -not $Force) {
+        Write-Host "Файл $(Split-Path -Leaf $path) используют и другие серверы: $(($others | ForEach-Object Name) -join ', ') — новая учётка заменит и их." -ForegroundColor Yellow
+        Write-Host "Если у $($named -join ', ') свой администратор, дайте серверу отдельный файл в $(Split-Path -Leaf $ConfigPath):" -ForegroundColor Yellow
+        Write-Host "    CredentialFile = '$($named[0].ToLower()).cred.xml'" -ForegroundColor Yellow
+        $answer = Read-Host 'Сохранить одну учётку для всех этих серверов? Для продолжения введите YES'
+        if ($answer -ne 'YES') { Write-Host 'Отменено, файл не изменён.' -ForegroundColor Yellow; exit 1 }
+    }
 
     $cred = Get-Credential -Message "Администратор Windows $forText.`nИмя: ДОМЕН\пользователь — доменная учётка, ИМЯСЕРВЕРА\пользователь — локальная учётка сервера.`nБудет сохранён в $path"
     if (-not $cred) { Write-Host 'Отменено.' -ForegroundColor Yellow; exit 1 }
@@ -584,7 +728,7 @@ if ($List) {
             'Имя'        = $_.Name
             'Адрес'      = $_.Address
             'ОС'         = $_.OS
-            'Способ'     = if ($_.Method -eq 'SSH') { "SSH $($_.User), порт $($_.Port)" } else { $_.Method }
+            'Способ'     = if ($_.Method -eq 'SSH') { "SSH $($_.User), порт $($_.Port), $(Get-KeyText $_)" } else { $_.Method }
             'Роль'       = $_.Role
             'Примечание' = $_.Notes
             'Вкл'        = if ($_.Enabled) { 'да' } else { 'нет' }

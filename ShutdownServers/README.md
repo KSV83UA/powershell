@@ -56,14 +56,61 @@ ssh-keygen -t ed25519                       # Enter на все вопросы: 
 Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub | ssh admin@192.168.1.21 "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
 ```
 
-Если входите не под `root`, разрешите пользователю выключение без пароля (на Linux-сервере):
+#### Разные ключи для разных серверов
+
+Общий ключ для всех серверов задаёт `SshKeyFile` (пусто — стандартные ключи из `~\.ssh`). Серверу со своим ключом укажите `KeyFile` в его описании — остальные продолжат использовать общий:
+
+```powershell
+@{
+    Name    = 'PVE1'
+    Address = '192.168.1.32'
+    OS      = 'Linux'
+    Stage   = 3
+    KeyFile = 'keys\pve1_ed25519'    # путь от папки с infrastructure.psd1; можно и '%USERPROFILE%\.ssh\pve1_ed25519'
+}
+```
+
+Создать ключ и добавить его на сервер (в папке скрипта):
+
+```powershell
+mkdir .\keys -Force
+ssh-keygen -t ed25519 -f .\keys\pve1_ed25519      # Enter на вопрос о пароле: ключ без пароля
+Get-Content .\keys\pve1_ed25519.pub | ssh root@192.168.1.32 "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
+```
+
+Папка `keys\` в git не попадает. Какой ключ у какого сервера, видно в `-List`, `-DryRun` и `-Check`. Если ssh пишет `UNPROTECTED PRIVATE KEY FILE` — см. «Устранение неполадок».
+
+#### Вход не под root: sudo без пароля для выключения
+
+Под обычным пользователем скрипт выключает сервер командой `sudo -n shutdown -h now`. Пароль для `sudo` скрипт не вводит и не хранит, поэтому без настройки `-Check` покажет:
+
+```
+ОШИБКА: вход OK, но sudo не разрешает 'sudo -n shutdown -h now' без пароля: sudo: a password is required
+```
+
+Разрешите этому пользователю **одну команду** `shutdown` без пароля. На Linux-сервере, войдя под ним (sudo один раз спросит пароль), — вместо `admin` подставьте имя пользователя из `User` / `SshUser`:
 
 ```bash
 echo 'admin ALL=(root) NOPASSWD: /usr/sbin/shutdown, /sbin/shutdown' | sudo tee /etc/sudoers.d/shutdown
-sudo chmod 440 /etc/sudoers.d/shutdown && sudo visudo -c
+sudo chmod 440 /etc/sudoers.d/shutdown
+sudo visudo -c
 ```
 
-Для своей команды (`Command = 'sudo -n /sbin/poweroff'`) в sudoers укажите её.
+- `visudo -c` проверяет синтаксис и должен вывести `parsed OK` для всех файлов. Не пропускайте его: ошибка в файлах sudoers может сломать `sudo` целиком.
+- Без пароля разрешён только `shutdown`, остальные команды через `sudo` по-прежнему спрашивают пароль.
+- Файлы из `/etc/sudoers.d/` читаются после основных правил, поэтому правило сработает, даже если пользователь состоит в группе `sudo` / `wheel`.
+- Имя файла в `/etc/sudoers.d/` — без точки и без `~` в конце, иначе sudo его пропустит.
+- Для своей команды (`Command = 'sudo -n /sbin/poweroff'`) укажите в правиле её: `NOPASSWD: /sbin/poweroff`. Полный путь к команде покажет `command -v poweroff`.
+
+Проверка на сервере — сбросить запомненный пароль и спросить sudo:
+
+```bash
+sudo -k; sudo -n -l shutdown -h now
+```
+
+Правило работает, если команда вывела путь (`/usr/sbin/shutdown`); `a password is required` — правило не применилось. Затем на компьютере со скриптом: `.\Stop-Servers.ps1 -Check -Name ИМЯ_СЕРВЕРА` — должно быть `вход по ключу и sudo без пароля — OK`.
+
+Можно вместо этого входить под `root` (`User = 'root'`), но тогда на сервере нужно разрешить вход root по SSH-ключу — это полный доступ к серверу. Правило sudo для одной команды безопаснее.
 
 ### 3. Доступ к Windows
 
@@ -89,7 +136,7 @@ CredentialFile = 'backup.cred.xml'
 .\Stop-Servers.ps1 -SaveCredential -Name BACKUP
 ```
 
-Остальные серверы продолжают использовать общий файл. Своих файлов может быть сколько угодно; несколько серверов с одним администратором могут ссылаться на один файл.
+Остальные серверы продолжают использовать общий файл. Своих файлов может быть сколько угодно; несколько серверов с одним администратором могут ссылаться на один файл. Если файл сервера используют и другие серверы (например, у всех указан `windows.cred.xml`), `-SaveCredential -Name` предупредит, что учётка заменится и у них, и попросит подтверждение.
 
 Как вводить имя в окне запроса:
 
@@ -165,7 +212,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Scripts\ShutdownServe
 | `PollIntervalSec` | Как часто проверять, выключился ли сервер, сек | `5` |
 | `SshUser` | Пользователь SSH | `root` |
 | `SshPort` | Порт SSH | `22` |
-| `SshKeyFile` | Закрытый ключ SSH (пусто — `~\.ssh\id_*`) | пусто |
+| `SshKeyFile` | Закрытый ключ SSH для всех серверов (пусто — `~\.ssh\id_*`); свой ключ сервера — `KeyFile` | пусто |
 | `SshKnownHostsFile` | Файл ключей серверов (пусто — `~\.ssh\known_hosts`) | `known_hosts` |
 | `SshConnectTimeoutSec` | Таймаут подключения SSH, сек | `10` |
 | `WindowsMethod` | Способ для Windows: `WMI` / `WinRM` / `SSH` | `WMI` |
@@ -196,10 +243,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Scripts\ShutdownServe
 | Проблема | Решение |
 |----------|---------|
 | `Unexpected token` / кракозябры | Файл сохранён без BOM — пересохраните в UTF-8 с BOM |
+| `Ошибка в файле конфигурации` с номерами строк | Ошибка синтаксиса в `infrastructure.psd1`, строки с ней помечены `>`. Обычно это лишняя или пропущенная скобка `)` / `}`, незакрытая кавычка `'` или пропущенный `=`; PowerShell иногда указывает на строку выше настоящей ошибки |
 | `не имеет цифровой подписи` / `выполнение сценариев отключено` | Политика выполнения `AllSigned` / `Restricted` — запускайте с `-ExecutionPolicy Bypass` (см. «Требования») |
 | `Permission denied (publickey)` | Ключ не добавлен в `authorized_keys` или скрипт запущен от другого пользователя — укажите `SshKeyFile` |
 | `UNPROTECTED PRIVATE KEY FILE` | Доступ к файлу ключа есть у других пользователей — оставьте права только владельцу (`icacls .\ключ /inheritance:r /grant:r "$($env:USERNAME):R"`) |
-| `sudo не разрешает … без пароля` | Добавьте правило в `/etc/sudoers.d/shutdown` (см. шаг 2) |
+| `sudo не разрешает … без пароля` | Добавьте правило в `/etc/sudoers.d/shutdown` (шаг 2, «Вход не под root») и проверьте `sudo -k; sudo -n -l shutdown -h now` |
 | `REMOTE HOST IDENTIFICATION HAS CHANGED` | Сервер переустановлен — удалите его строку из `known_hosts` |
 | `Отказано в доступе` / `Access is denied` для WMI/WinRM | `-Check` пишет, под какой учёткой был вход. Файла учётных данных нет — сохраните `-SaveCredential` (шаг 3). Учётка из файла — неверный пароль, нет прав администратора на сервере, имя без `ДОМЕН\` / `ИМЯСЕРВЕРА\` или (локальная учётка не в домене) нужен `LocalAccountTokenFilterPolicy` |
 | `RPC server is unavailable` | Закрыт WMI в брандмауэре сервера (шаг 3) |

@@ -23,6 +23,7 @@
     Файл описания инфраструктуры. По умолчанию infrastructure.psd1 рядом со скриптом.
 .PARAMETER Name
     Выключить только эти серверы (имена из конфигурации, можно с * и ?).
+    С -SaveCredential — сервер, для которого сохраняется своя учётка.
 .PARAMETER Stage
     Выключить только эти очереди.
 .PARAMETER List
@@ -34,7 +35,8 @@
 .PARAMETER Force
     Не спрашивать подтверждение.
 .PARAMETER SaveCredential
-    Запросить учётные данные администратора Windows и сохранить их в CredentialFile.
+    Запросить учётные данные администратора Windows и сохранить их: без -Name — в общий CredentialFile,
+    с -Name — в CredentialFile этого сервера (сервер не в домене или с другим администратором).
     Файл шифруется DPAPI: прочитать его сможет только тот же пользователь на этом же компьютере.
 
 .EXAMPLE
@@ -45,6 +47,8 @@
     .\Stop-Servers.ps1 -Stage 1 -DryRun
 .EXAMPLE
     .\Stop-Servers.ps1 -Name DB1, FILES
+.EXAMPLE
+    .\Stop-Servers.ps1 -SaveCredential -Name BACKUP
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Scripts\ShutdownServers\Stop-Servers.ps1 -Force
 #>
@@ -236,12 +240,44 @@ function Get-ServerCredential {
     $script:CredentialCache[$path]
 }
 
+function Test-UsesCredentialFile {
+    param($Server)
+    $Server.CredentialFile -and ($Server.CredentialExplicit -or (Test-Path -LiteralPath $Server.CredentialFile -PathType Leaf))
+}
+
 function Get-CredentialText {
     param($Server)
-    if ($Server.CredentialFile -and ($Server.CredentialExplicit -or (Test-Path -LiteralPath $Server.CredentialFile -PathType Leaf))) {
-        return "учётка из $(Split-Path -Leaf $Server.CredentialFile)"
+    if (Test-UsesCredentialFile $Server) {
+        $file = Split-Path -Leaf $Server.CredentialFile
+        try { return "под $((Get-ServerCredential $Server).UserName) из $file" }
+        catch { return "учётка из $file" }   # саму ошибку чтения покажет попытка входа
     }
-    "права $script:CurrentUser"
+    "под $script:CurrentUser (текущий пользователь)"
+}
+
+function Test-AccessDenied {
+    param($ErrorRecord)
+    # 0x80070005 — отказано в доступе, 0x8007052E — неверное имя пользователя или пароль
+    for ($e = $ErrorRecord.Exception; $e; $e = $e.InnerException) {
+        if ($e.HResult -eq 0x80070005 -or $e.HResult -eq 0x8007052E) { return $true }
+    }
+    # WinRM и Stop-Computer заворачивают код в своё исключение — остаётся текст (английский или русский)
+    (Get-ErrorText $ErrorRecord) -match 'access is denied|отказано в доступе|user name or password|имя пользователя или (неверный )?пароль|logon failure'
+}
+
+function Get-WindowsFailureText {
+    param($Server, $ErrorRecord)
+    $text = "$($Server.Method): $(Get-ErrorText $ErrorRecord)"
+    if (-not (Test-AccessDenied $ErrorRecord)) { return $text }
+
+    $save = if ($Server.CredentialExplicit) { ".\Stop-Servers.ps1 -SaveCredential -Name $($Server.Name)" } else { '.\Stop-Servers.ps1 -SaveCredential' }
+    if (Test-UsesCredentialFile $Server) {
+        return "$text Вход $(Get-CredentialText $Server): неверный пароль или у этой учётки нет прав администратора на сервере. Пересохранить: $save"
+    }
+    if (-not $Server.CredentialFile) {
+        return "$text Вход $(Get-CredentialText $Server), а CredentialFile не задан. Укажите его в описании инфраструктуры и сохраните учётку администратора сервера: $save"
+    }
+    "$text Вход $(Get-CredentialText $Server), файла $(Split-Path -Leaf $Server.CredentialFile) нет. Сохраните учётку администратора сервера: $save"
 }
 
 function Get-ActionText {
@@ -285,7 +321,7 @@ function Invoke-ServerShutdown {
         Stop-Computer @params
         New-Result $true 'команда выключения принята'
     }
-    catch { New-Result $false (Get-ErrorText $_) }
+    catch { New-Result $false (Get-WindowsFailureText $Server $_) }
 }
 
 function Test-ServerAccess {
@@ -321,7 +357,7 @@ function Test-ServerAccess {
         }
         New-Result $true "$($Server.Method) — OK ($caption, $(Get-CredentialText $Server))"
     }
-    catch { New-Result $false "$($Server.Method): $(Get-ErrorText $_)" }
+    catch { New-Result $false (Get-WindowsFailureText $Server $_) }
 }
 
 # ======================= конфигурация =======================
@@ -414,6 +450,21 @@ foreach ($raw in $rawServers) {
     if ($os -eq 'Windows' -and $method -eq 'SSH' -and -not $raw['User']) {
         $problems.Add("${label}: для Windows по SSH укажите User — администратора Windows (SshUser '$($cfg.SshUser)' — для Linux)")
     }
+    # параметры не того способа молча игнорировались бы — а человек думает, что они работают
+    if ($method -eq 'SSH') {
+        if ($raw.ContainsKey('CredentialFile')) {
+            $problems.Add("${label}: CredentialFile — для Windows по WMI/WinRM, а этот сервер выключается по SSH с ключом. Уберите CredentialFile")
+        }
+    }
+    else {
+        $saveHint = if ($raw['CredentialFile']) { ".\Stop-Servers.ps1 -SaveCredential -Name $serverName" } else { '.\Stop-Servers.ps1 -SaveCredential' }
+        if ($raw.ContainsKey('User')) {
+            $problems.Add("${label}: User — пользователь SSH, а сервер выключается по ${method}: учётка Windows берётся из файла учётных данных. Уберите User и сохраните учётку: $saveHint")
+        }
+        $sshOnly = @('Port', 'KeyFile', 'Command' | Where-Object { $raw.ContainsKey($_) })
+        if ($sshOnly.Count -eq 1) { $problems.Add("${label}: $($sshOnly[0]) — параметр SSH, а сервер выключается по $method. Уберите его") }
+        elseif ($sshOnly.Count) { $problems.Add("${label}: $($sshOnly -join ', ') — параметры SSH, а сервер выключается по $method. Уберите их") }
+    }
 
     $port = $cfg.SshPort
     if ($raw.ContainsKey('Port')) {
@@ -466,21 +517,6 @@ $script:KnownHostsFile = Resolve-ConfigPath ([string]$cfg.SshKnownHostsFile) $co
 $script:CredentialCache = @{}
 $script:CurrentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 
-# ======================= -SaveCredential =======================
-
-if ($SaveCredential) {
-    $path = Resolve-ConfigPath ([string]$cfg.CredentialFile) $configDir
-    if (-not $path) { throw "CredentialFile в $ConfigPath пуст — некуда сохранять." }
-    $cred = Get-Credential -Message "Администратор серверов Windows (будет сохранён в $path)"
-    if (-not $cred) { Write-Host 'Отменено.' -ForegroundColor Yellow; exit 1 }
-    $dir = Split-Path -Parent $path
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $cred | Export-Clixml -LiteralPath $path
-    Write-Host "Сохранено: $path" -ForegroundColor Green
-    Write-Host "Файл расшифрует только $script:CurrentUser на компьютере $env:COMPUTERNAME — запускайте выключение от этой же учётной записи." -ForegroundColor Yellow
-    exit 0
-}
-
 # ======================= выбор серверов =======================
 
 # .ToArray(), а не @($servers): в PowerShell 5.1 @() от List[object] падает с «Argument types do not match»
@@ -495,6 +531,48 @@ if ($Name) {
 }
 if ($Stage) { $filtered = @($filtered | Where-Object { $Stage -contains $_.Stage }) }
 $filtered = @($filtered | Sort-Object Stage, Index)
+
+# ======================= -SaveCredential =======================
+
+if ($SaveCredential) {
+    if ($Stage) { throw '-SaveCredential и -Stage нельзя использовать вместе: учётка сохраняется для сервера (-Name) или общая (без ключей).' }
+    if ($Name) {
+        # свой файл сервера: сервер не в домене или с другим администратором
+        $ssh = @($filtered | Where-Object Method -eq 'SSH')
+        if ($ssh.Count) { throw "$(($ssh | ForEach-Object Name) -join ', '): выключается по SSH с ключом — учётные данные Windows не нужны." }
+        $shared = @($filtered | Where-Object { -not $_.CredentialExplicit })
+        if ($shared.Count) {
+            throw ("У $(($shared | ForEach-Object Name) -join ', ') нет своего файла учётных данных — используется общий $(Split-Path -Leaf ([string]$cfg.CredentialFile)).`n" +
+                   "Чтобы задать отдельного администратора, добавьте серверу в $(Split-Path -Leaf $ConfigPath) строку`n" +
+                   "    CredentialFile = '$($shared[0].Name.ToLower()).cred.xml'`n" +
+                   "и повторите команду. Общую учётку сохраняет .\Stop-Servers.ps1 -SaveCredential без -Name.")
+        }
+        $paths = @($filtered | ForEach-Object CredentialFile | Sort-Object -Unique)
+        if ($paths.Count -gt 1) { throw "У $(($filtered | ForEach-Object Name) -join ', ') разные файлы учётных данных — укажите в -Name один сервер." }
+        $path = $paths[0]
+        $users = @($servers | Where-Object { $_.Method -ne 'SSH' -and $_.CredentialFile -eq $path })
+    }
+    else {
+        $path = Resolve-ConfigPath ([string]$cfg.CredentialFile) $configDir
+        if (-not $path) { throw "CredentialFile в $ConfigPath пуст — некуда сохранять." }
+        $users = @($servers | Where-Object { $_.Method -ne 'SSH' -and -not $_.CredentialExplicit })
+    }
+    $forText = if ($users.Count) { "для $(($users | ForEach-Object Name) -join ', ')" } else { '(пока ни один сервер его не использует)' }
+
+    $cred = Get-Credential -Message "Администратор Windows $forText.`nИмя: ДОМЕН\пользователь — доменная учётка, ИМЯСЕРВЕРА\пользователь — локальная учётка сервера.`nБудет сохранён в $path"
+    if (-not $cred) { Write-Host 'Отменено.' -ForegroundColor Yellow; exit 1 }
+    $dir = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $cred | Export-Clixml -LiteralPath $path
+    Write-Host "Сохранено: $path — $($cred.UserName) $forText" -ForegroundColor Green
+    if ($cred.UserName -notmatch '[\\@]' -or $cred.UserName -like '.\*') {
+        Write-Host "Имя '$($cred.UserName)' без домена или имени сервера: удалённый вход может не пройти. Лучше ДОМЕН\пользователь или ИМЯСЕРВЕРА\пользователь — пересохраните, если -Check покажет отказ." -ForegroundColor Yellow
+    }
+    Write-Host "Файл расшифрует только $script:CurrentUser на компьютере $env:COMPUTERNAME — запускайте выключение от этой же учётной записи." -ForegroundColor Yellow
+    $checkArgs = if ($users.Count) { " -Name $(($users | ForEach-Object Name) -join ', ')" } else { '' }
+    Write-Host "Проверка: .\Stop-Servers.ps1 -Check$checkArgs"
+    exit 0
+}
 
 # ======================= -List =======================
 

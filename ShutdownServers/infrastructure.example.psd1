@@ -39,8 +39,10 @@
     # --- Windows ---
     # Способ по умолчанию: WMI (Stop-Computer по DCOM) | WinRM (Stop-Computer по WS-Man) | SSH
     WindowsMethod = 'WMI'
-    # Учётные данные администратора Windows. Создаётся командой .\Stop-Servers.ps1 -SaveCredential.
+    # Общие учётные данные администратора Windows (обычно доменный: ДОМЕН\пользователь).
+    # Создаётся командой .\Stop-Servers.ps1 -SaveCredential.
     # Если файла нет — используются права пользователя, от которого запущен скрипт (удобно в домене).
+    # Серверу не из домена или с другим администратором задайте свой CredentialFile (пример — BACKUP ниже).
     CredentialFile = 'windows.cred.xml'
 
     # Папка логов. Относительные пути здесь и ниже — от папки с этим файлом.
@@ -59,10 +61,12 @@
     #    Role, Notes    — описание: что за сервер, что на нём работает, где стоит
     #    Enabled        — $false: сервер есть в описании, но скрипт его не выключает
     #    Method         — переопределить способ (Windows: WMI | WinRM | SSH; Linux: только SSH)
-    #    User, Port, KeyFile — переопределить SshUser / SshPort / SshKeyFile
+    #    User, Port, KeyFile — переопределить SshUser / SshPort / SshKeyFile. Только для SSH:
+    #                     у Windows по WMI/WinRM учётка берётся из CredentialFile, а не из User
     #                     (для Windows с Method = 'SSH' User обязателен — администратор Windows)
     #    Command        — своя команда выключения для SSH (например, для NAS или гипервизора)
-    #    CredentialFile — отдельный файл учётных данных для этого сервера Windows
+    #    CredentialFile — свой файл учётных данных для этого сервера Windows (не в домене или
+    #                     другой администратор). Создаётся: .\Stop-Servers.ps1 -SaveCredential -Name <Name>
     #
     #  Компьютер, на котором запускается скрипт, в список не включайте:
     #  выключив его, скрипт оборвётся на середине.
@@ -102,6 +106,17 @@
             Stage   = 2
             Role    = 'Файловый сервер'
             Method  = 'WinRM'       # пример: этот сервер выключается по WinRM, а не по WMI
+        }
+        @{
+            Name    = 'BACKUP'
+            Address = '192.0.2.23'
+            OS      = 'Windows'
+            Stage   = 2
+            Role    = 'Сервер резервного копирования'
+            Notes   = 'Не в домене, свой администратор'
+            # Своя учётка вместо общей. Создать: .\Stop-Servers.ps1 -SaveCredential -Name BACKUP
+            # Имя вводить как BACKUP\Administrator — имя компьютера сервера и пользователь.
+            CredentialFile = 'backup.cred.xml'
         }
 
         # --- Очередь 3: хранилища и гипервизоры — в самом конце ---

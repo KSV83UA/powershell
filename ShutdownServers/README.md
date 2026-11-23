@@ -23,6 +23,14 @@
 
 > **Кодировка:** `.ps1` и `.psd1` сохраняйте в **UTF-8 с BOM**, иначе PowerShell 5.1 испортит кириллицу и выдаст `Unexpected token`.
 
+> **Политика выполнения:** скрипт не подписан. Если PowerShell пишет «файл не имеет цифровой подписи» или «выполнение сценариев отключено» (политика `AllSigned` или `Restricted`, проверить — `Get-ExecutionPolicy -List`), разрешите запуск только для текущего окна:
+>
+> ```powershell
+> Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+> ```
+>
+> или запускайте так: `powershell -ExecutionPolicy Bypass -File .\Stop-Servers.ps1 -Check`. Настройку компьютера это не меняет. Если политика задана групповой политикой (`MachinePolicy` / `UserPolicy`), обход не сработает — подпишите скрипт сертификатом для подписи кода или попросите исключение в GPO.
+
 ## Быстрый старт
 
 ### 1. Описание инфраструктуры
@@ -164,6 +172,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Scripts\ShutdownServe
 | Проблема | Решение |
 |----------|---------|
 | `Unexpected token` / кракозябры | Файл сохранён без BOM — пересохраните в UTF-8 с BOM |
+| `не имеет цифровой подписи` / `выполнение сценариев отключено` | Политика выполнения `AllSigned` / `Restricted` — запускайте с `-ExecutionPolicy Bypass` (см. «Требования») |
 | `Permission denied (publickey)` | Ключ не добавлен в `authorized_keys` или скрипт запущен от другого пользователя — укажите `SshKeyFile` |
 | `UNPROTECTED PRIVATE KEY FILE` | Доступ к файлу ключа есть у других пользователей — оставьте права только владельцу (`icacls .\ключ /inheritance:r /grant:r "$($env:USERNAME):R"`) |
 | `sudo не разрешает … без пароля` | Добавьте правило в `/etc/sudoers.d/shutdown` (см. шаг 2) |

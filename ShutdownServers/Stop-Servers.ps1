@@ -54,7 +54,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$ConfigPath = (Join-Path $PSScriptRoot 'infrastructure.psd1'),
+    [string]$ConfigPath,   # пусто — infrastructure.psd1 рядом со скриптом (см. ниже)
     [string[]]$Name,
     [int[]]$Stage,
     [switch]$List,
@@ -65,6 +65,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Не в значении по умолчанию в param(): в PowerShell 5.1 при запуске через powershell.exe -File
+# (ярлык, ПО ИБП, планировщик) $PSScriptRoot там пуст у скрипта с [CmdletBinding()]
+if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot 'infrastructure.psd1' }
 
 # Необработанная ошибка (например, в описании инфраструктуры) — только текст и код возврата 1,
 # без служебного вывода PowerShell, который печатает сообщение дважды

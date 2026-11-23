@@ -7,6 +7,7 @@
 | Файл | Назначение |
 |------|------------|
 | `Stop-Servers.ps1` | Выключение, проверка, план, описание инфраструктуры |
+| `Stop-Servers.cmd` | Запуск двойным щелчком или с ярлыка, без настройки политики выполнения |
 | `infrastructure.example.psd1` | Пример описания инфраструктуры с комментариями ко всем параметрам |
 | `infrastructure.psd1` | **Ваше** описание (создаётся из примера, в git не попадает) |
 | `windows.cred.xml` | Учётные данные администратора Windows, зашифрованы DPAPI (создаётся `-SaveCredential`) |
@@ -29,7 +30,7 @@
 > Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 > ```
 >
-> или запускайте так: `powershell -ExecutionPolicy Bypass -File .\Stop-Servers.ps1 -Check`. Настройку компьютера это не меняет. Если политика задана групповой политикой (`MachinePolicy` / `UserPolicy`), обход не сработает — подпишите скрипт сертификатом для подписи кода или попросите исключение в GPO.
+> или запускайте так: `powershell -ExecutionPolicy Bypass -File .\Stop-Servers.ps1 -Check`, или через `.\Stop-Servers.cmd -Check` (см. «Ярлык на рабочем столе»). Настройку компьютера это не меняет. Если политика задана групповой политикой (`MachinePolicy` / `UserPolicy`), обход не сработает — подпишите скрипт сертификатом для подписи кода или попросите исключение в GPO.
 
 ## Быстрый старт
 
@@ -176,6 +177,24 @@ New-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\
 .\Stop-Servers.ps1 -Name DB1, FILES      # только эти серверы (можно с * и ?)
 .\Stop-Servers.ps1 -Force                # без вопросов — для ИБП и планировщика
 ```
+
+### Ярлык на рабочем столе
+
+`Stop-Servers.cmd` запускает скрипт двойным щелчком: покажет план, спросит `YES`, выключит серверы и оставит окно открытым с итогом. Политику выполнения он обходит только для этого запуска — `AllSigned` и другие настройки компьютера не мешают и не меняются. Параметры передаются скрипту: `.\Stop-Servers.cmd -Check`. С `-Force` окно не ждёт нажатия клавиши.
+
+Ярлык с иконкой выключения (укажите свою папку со скриптом):
+
+```powershell
+$s = (New-Object -ComObject WScript.Shell).CreateShortcut("$([Environment]::GetFolderPath('Desktop'))\Выключить серверы.lnk")
+$s.TargetPath = 'C:\Scripts\ShutdownServers\Stop-Servers.cmd'
+$s.WorkingDirectory = 'C:\Scripts\ShutdownServers'
+$s.IconLocation = "$env:SystemRoot\System32\shell32.dll,27"
+$s.Save()
+```
+
+Или проще: правой кнопкой по `Stop-Servers.cmd` → «Отправить» → «Рабочий стол (создать ярлык)». Запускайте ярлык от той учётной записи, под которой сохранены учётные данные и SSH-ключи; запуск от администратора не нужен.
+
+### ИБП и планировщик
 
 Для ПО ИБП (PowerChute, NUT, «выполнить команду при работе от батареи») или задачи планировщика:
 

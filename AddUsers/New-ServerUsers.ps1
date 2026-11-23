@@ -46,7 +46,7 @@
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [string]$UserList = (Join-Path $PSScriptRoot 'New-ServerUsers.users.csv'),
+    [string]$UserList,   # пусто - New-ServerUsers.users.csv рядом со скриптом (см. ниже)
 
     [string]$PasswordFile,
 
@@ -55,6 +55,10 @@ param(
 
     [switch]$PasswordNeverExpires = $true
 )
+
+# Не в значении по умолчанию в param(): в PowerShell 5.1 при запуске через powershell.exe -File
+# (ярлык, планировщик) $PSScriptRoot там пуст у скрипта с [CmdletBinding()]
+if (-not $UserList) { $UserList = Join-Path $PSScriptRoot 'New-ServerUsers.users.csv' }
 
 $ErrorActionPreference = 'Stop'
 

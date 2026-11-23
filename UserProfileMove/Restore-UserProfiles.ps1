@@ -47,12 +47,16 @@
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [string]$ConfigPath = (Join-Path $PSScriptRoot 'Backup-UserProfiles.config.psd1'),
+    [string]$ConfigPath,   # пусто - Backup-UserProfiles.config.psd1 рядом со скриптом (см. ниже)
 
     [string]$BackupRoot,
 
     [string[]]$User = '*'
 )
+
+# Не в значении по умолчанию в param(): в PowerShell 5.1 при запуске через powershell.exe -File
+# (ярлык, планировщик) $PSScriptRoot там пуст у скрипта с [CmdletBinding()]
+if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot 'Backup-UserProfiles.config.psd1' }
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem

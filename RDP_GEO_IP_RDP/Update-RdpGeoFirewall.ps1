@@ -10,9 +10,13 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$ConfigPath = (Join-Path $PSScriptRoot 'config.psd1'),
+    [string]$ConfigPath,   # пусто — config.psd1 рядом со скриптом (см. ниже)
     [switch]$Force
 )
+
+# Не в значении по умолчанию в param(): в PowerShell 5.1 при запуске через powershell.exe -File
+# (ярлык, планировщик) $PSScriptRoot там пуст у скрипта с [CmdletBinding()]
+if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot 'config.psd1' }
 
 . (Join-Path $PSScriptRoot '_FirewallCommon.ps1')
 

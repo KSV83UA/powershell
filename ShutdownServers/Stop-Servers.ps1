@@ -13,11 +13,15 @@
     Сервер, который не отвечает ещё до начала, считается выключенным и пропускается.
     Если сервер очереди не выключился за StageTimeoutSec, скрипт всё равно переходит к следующей
     очереди (при отключении питания ждать бесконечно нельзя) и отмечает его в итоге как ошибку.
+    Если команда выключения не прошла, но сервер перестал отвечать (например, ВМ на уже выключенном
+    хосте), в итоге он отмечается отдельно — выключен ли он, скрипт не знает.
+    Если у нескольких серверов один адрес, выключается первый, остальным команда не посылается.
 
     Перед выключением показывается план и запрашивается подтверждение (YES).
     Для запуска без вопросов — из ПО ИБП или планировщика — ключ -Force.
 
-    Код возврата: 0 — всё выключено (или уже было выключено), 1 — были ошибки или отмена.
+    Код возврата: 0 — всё выключено (или уже было выключено), 1 — были ошибки, неподтверждённые
+    выключения или отмена.
 
 .PARAMETER ConfigPath
     Файл описания инфраструктуры. По умолчанию infrastructure.psd1 рядом со скриптом.
@@ -277,8 +281,9 @@ function Get-SshExe {
 }
 
 function New-Result {
-    param([bool]$Ok, [string]$Message)
-    [pscustomobject]@{ Ok = $Ok; Message = $Message }
+    param([bool]$Ok, [string]$Message, [string]$ComputerName = '')
+    # ComputerName — имя компьютера, который на самом деле ответил по адресу (-Check для Windows)
+    [pscustomobject]@{ Ok = $Ok; Message = $Message; ComputerName = $ComputerName }
 }
 
 function Get-LastLine {
@@ -396,6 +401,18 @@ function Test-AccessDenied {
     (Get-ErrorText $ErrorRecord) -match 'access is denied|отказано в доступе|user name or password|имя пользователя или (неверный )?пароль|logon failure'
 }
 
+function Test-ShutdownInProgress {
+    param($ErrorRecord)
+    # 0x8007045B (1115) — на сервере уже идёт завершение работы: команда не нужна, остаётся дождаться
+    for ($e = $ErrorRecord.Exception; $e; $e = $e.InnerException) {
+        if ($e.HResult -eq 0x8007045B) { return $true }
+        if ($e -is [ComponentModel.Win32Exception] -and $e.NativeErrorCode -eq 1115) { return $true }
+    }
+    # Stop-Computer по DCOM вкладывает текст ошибки Windows в своё сообщение без кода.
+    # Не 'завершение работы системы' целиком: так начинается и ошибка 1116 «...не выполняется»
+    (Get-ErrorText $ErrorRecord) -match 'system shutdown is in progress|д[её]т завершение работы системы'
+}
+
 function Get-WindowsFailureText {
     param($Server, $ErrorRecord)
     $text = "$($Server.Method): $(Get-ErrorText $ErrorRecord)"
@@ -414,6 +431,18 @@ function Get-WindowsFailureText {
 function Get-KeyText {
     param($Server)
     if ($Server.KeyFile) { "ключ $(Split-Path -Leaf $Server.KeyFile)" } else { 'стандартные ключи ~\.ssh' }
+}
+
+function Get-DuplicateText {
+    param($Server)
+    "тот же адрес $($Server.Address), что у $($Server.DuplicateOf)"
+}
+
+function Write-DuplicateWarning {
+    param([object[]]$Servers)
+    foreach ($s in ($Servers | Where-Object DuplicateOf)) {
+        Write-Log "$($s.Name): $(Get-DuplicateText $s) — не выключается, иначе команда ушла бы тому же компьютеру. Впишите настоящий адрес $($s.Name) или удалите лишнюю запись." 'WARN'
+    }
 }
 
 function Get-ActionText {
@@ -457,7 +486,10 @@ function Invoke-ServerShutdown {
         Stop-Computer @params
         New-Result $true 'команда выключения принята'
     }
-    catch { New-Result $false (Get-WindowsFailureText $Server $_) }
+    catch {
+        if (Test-ShutdownInProgress $_) { return New-Result $true 'уже выключается — сервер ответил «идёт завершение работы системы»' }
+        New-Result $false (Get-WindowsFailureText $Server $_)
+    }
 }
 
 function Test-ServerAccess {
@@ -483,16 +515,19 @@ function Test-ServerAccess {
     try {
         $cred = Get-ServerCredential $Server
         if ($Server.Method -eq 'WinRM') {
-            $params = @{ ComputerName = $Server.Address; ScriptBlock = { (Get-CimInstance Win32_OperatingSystem).Caption }; ErrorAction = 'Stop' }
+            $params = @{ ComputerName = $Server.Address; ScriptBlock = { Get-CimInstance Win32_OperatingSystem | Select-Object CSName, Caption }; ErrorAction = 'Stop' }
             if ($cred) { $params.Credential = $cred }
-            $caption = Invoke-Command @params
+            $os = Invoke-Command @params
         }
         else {
             $params = @{ Class = 'Win32_OperatingSystem'; ComputerName = $Server.Address; ErrorAction = 'Stop' }
             if ($cred) { $params.Credential = $cred }
-            $caption = (Get-WmiObject @params).Caption
+            $os = Get-WmiObject @params
         }
-        New-Result $true "$($Server.Method) — OK ($caption, $(Get-CredentialText $Server))"
+        # имя компьютера, который ответил: неверный адрес в описании сразу виден
+        $computer = [string]$os.CSName
+        $computerText = if ($computer) { "компьютер $computer, " } else { '' }
+        New-Result $true "$($Server.Method) — OK ($computerText$($os.Caption), $(Get-CredentialText $Server))" $computer
     }
     catch { New-Result $false (Get-WindowsFailureText $Server $_) }
 }
@@ -638,6 +673,7 @@ foreach ($raw in $rawServers) {
         CredentialExplicit = $credExplicit
         # по какому порту судить, что сервер ещё работает
         CheckPort          = switch ($method) { 'SSH' { $port } 'WMI' { 135 } 'WinRM' { 5985 } }
+        DuplicateOf        = ''   # имя сервера с тем же адресом, который выключается вместо этого (см. ниже)
     })
 }
 foreach ($dup in ($servers | Where-Object Name | Group-Object Name | Where-Object Count -gt 1)) {
@@ -645,6 +681,15 @@ foreach ($dup in ($servers | Where-Object Name | Group-Object Name | Where-Objec
 }
 if ($problems.Count) {
     throw ("В файле $ConfigPath найдены ошибки:`n  - " + ($problems -join "`n  - "))
+}
+
+# Один адрес у нескольких серверов — обычно скопированная запись, где забыли поменять Address:
+# команда «второму» ушла бы тому же компьютеру, а настоящий сервер остался бы включён.
+# Не ошибка конфигурации: из-за опечатки не должно сорваться всё выключение при пропадании питания.
+# Выключается первый по порядку, остальным команда не посылается — в итоге они среди невыключенных.
+foreach ($dup in ($servers | Where-Object Enabled | Group-Object Address | Where-Object Count -gt 1)) {
+    $same = @($dup.Group | Sort-Object Stage, Index)
+    foreach ($s in $same[1..($same.Count - 1)]) { $s.DuplicateOf = $same[0].Name }
 }
 
 $StageTimeoutSec = $cfg.StageTimeoutSec
@@ -739,6 +784,7 @@ if ($List) {
         }
     }
     Write-Table $rows
+    Write-DuplicateWarning $filtered
     exit 0
 }
 
@@ -761,6 +807,7 @@ if ($logDir) {
 
 $modeText = if ($Check) { 'проверка' } elseif ($DryRun) { 'план (DryRun)' } else { 'выключение' }
 Write-Log "=== Stop-Servers: $modeText | $script:CurrentUser на $env:COMPUTERNAME | $ConfigPath ==="
+Write-DuplicateWarning $selected
 
 if (@($selected | Where-Object Method -eq 'SSH').Count) {
     $script:SshExe = Get-SshExe
@@ -777,7 +824,8 @@ if ($Check) {
         Write-Host "Проверка $($s.Name) ($($s.Address))..." -ForegroundColor DarkGray
         $portOpen = Test-TcpPort -Address $s.Address -Port $s.CheckPort
         $pingOk = Test-Ping -Address $s.Address
-        $access = if ($portOpen) { Test-ServerAccess $s }
+        $access = if ($s.DuplicateOf) { New-Result $false "$(Get-DuplicateText $s) — не проверялся и не выключается" }
+                  elseif ($portOpen) { Test-ServerAccess $s }
                   elseif ($pingOk) { New-Result $false "ping есть, но порт $($s.CheckPort) закрыт (служба не запущена или брандмауэр)" }
                   else { New-Result $false 'не отвечает' }
         [pscustomobject]@{
@@ -788,11 +836,17 @@ if ($Check) {
             'Порт'      = "$($s.CheckPort) $(if ($portOpen) { 'открыт' } else { 'закрыт' })"
             'Результат' = $(if ($access.Ok) { 'OK: ' } else { 'ОШИБКА: ' }) + $access.Message
             Ok          = $access.Ok
+            Computer    = $access.ComputerName
         }
     }
     $rows = @($rows)
-    Write-Table ($rows | Select-Object * -ExcludeProperty Ok)
+    Write-Table ($rows | Select-Object * -ExcludeProperty Ok, Computer)
     $bad = @($rows | Where-Object { -not $_.Ok }).Count
+    # адреса разные, а ответил один компьютер (IP и DNS-имя одного сервера и т.п.): выключится только он
+    foreach ($g in ($rows | Where-Object { $_.Ok -and $_.Computer } | Group-Object Computer | Where-Object Count -gt 1)) {
+        Write-Log "$(($g.Group | ForEach-Object 'Имя') -join ', '): по разным адресам отвечает один и тот же компьютер $($g.Name). Проверьте адреса и удалите лишнюю запись." 'WARN'
+        $bad += $g.Count - 1
+    }
     if ($bad) { Write-Log "Проблемы: $bad из $($rows.Count). Пока они не исправлены, эти серверы не выключатся." 'WARN'; exit 1 }
     Write-Log "Все $($rows.Count) серверов готовы к выключению." 'OK'
     exit 0
@@ -808,7 +862,8 @@ foreach ($group in $stages) {
     foreach ($s in $group.Group) {
         $role = if ($s.Role) { " — $($s.Role)" } else { '' }
         Write-Log "    $($s.Name) ($($s.Address), $($s.OS))$role"
-        Write-Log "        $(Get-ActionText $s)"
+        if ($s.DuplicateOf) { Write-Log "        не выключается: $(Get-DuplicateText $s)" 'WARN' }
+        else { Write-Log "        $(Get-ActionText $s)" }
     }
 }
 Write-Log ''
@@ -816,7 +871,7 @@ Write-Log ''
 if ($DryRun) { Write-Log 'DryRun: ничего не выключалось.' 'OK'; exit 0 }
 
 if (-not $Force) {
-    $answer = Read-Host "Будет выключено серверов: $($selected.Count). Для продолжения введите YES"
+    $answer = Read-Host "Будет выключено серверов: $(@($selected | Where-Object { -not $_.DuplicateOf }).Count). Для продолжения введите YES"
     if ($answer -ne 'YES') { Write-Log 'Отменено пользователем.' 'WARN'; exit 1 }
 }
 
@@ -824,8 +879,27 @@ if (-not $Force) {
 
 $results = New-Object 'System.Collections.Generic.List[object]'
 function Add-ServerResult {
-    param($Server, [ValidateSet('Off', 'Skipped', 'Failed')][string]$Kind, [string]$Text)
+    # Lost — команда не прошла, но сервер перестал отвечать: выключен ли он, скрипт не знает
+    param($Server, [ValidateSet('Off', 'Skipped', 'Lost', 'Failed')][string]$Kind, [string]$Text)
     $results.Add([pscustomobject]@{ Stage = $Server.Stage; Index = $Server.Index; Name = $Server.Name; Address = $Server.Address; Kind = $Kind; Text = $Text })
+}
+
+# Серверы, на которых команда выключения не прошла, тоже проверяются: сервер мог пропасть из сети сам —
+# например, ВМ, хост которой уже выключен (Hyper-V сохраняет или гасит свои ВМ). Ждать их отдельно не стоит:
+# смотрим, пока ждём остальных, и ещё раз в конце очереди (-Final), где оставшиеся считаются ошибкой.
+function Update-ErredServers {
+    param($Erred, [switch]$Final)
+    foreach ($e in $Erred.ToArray()) {
+        if (-not (Test-ServerAlive $e.Server)) {
+            Write-Log "$($e.Server.Name): команда не прошла, но сервер перестал отвечать — убедитесь, что он выключен (например, это ВМ на уже выключенном хосте)." 'WARN'
+            Add-ServerResult $e.Server Lost "перестал отвечать после ошибки команды: $($e.Message)"
+            [void]$Erred.Remove($e)
+        }
+        elseif ($Final) {
+            Add-ServerResult $e.Server Failed "ошибка: $($e.Message)"
+            [void]$Erred.Remove($e)
+        }
+    }
 }
 
 foreach ($group in $stages) {
@@ -833,7 +907,13 @@ foreach ($group in $stages) {
     Write-Log "--- Очередь $($group.Name): $(($members | ForEach-Object Name) -join ', ') ---"
 
     $waiting = New-Object 'System.Collections.Generic.List[object]'
+    $erred = New-Object 'System.Collections.Generic.List[object]'
     foreach ($s in $members) {
+        if ($s.DuplicateOf) {
+            Write-Log "$($s.Name): не выключаю — $(Get-DuplicateText $s)." 'ERROR'
+            Add-ServerResult $s Failed "не выключался: $(Get-DuplicateText $s)"
+            continue
+        }
         if (-not (Test-ServerAlive $s)) {
             Write-Log "$($s.Name): не отвечает — уже выключен или недоступен, пропущен." 'WARN'
             Add-ServerResult $s Skipped 'не отвечал ещё до начала — пропущен'
@@ -842,7 +922,7 @@ foreach ($group in $stages) {
         Write-Log "$($s.Name): выключаю — $(Get-ActionText $s)"
         $r = Invoke-ServerShutdown $s
         if ($r.Ok) { Write-Log "$($s.Name): $($r.Message)" 'OK'; $waiting.Add($s) }
-        else { Write-Log "$($s.Name): ОШИБКА — $($r.Message)" 'ERROR'; Add-ServerResult $s Failed "ошибка: $($r.Message)" }
+        else { Write-Log "$($s.Name): ОШИБКА — $($r.Message)" 'ERROR'; $erred.Add([pscustomobject]@{ Server = $s; Message = $r.Message }) }
     }
 
     $timer = [Diagnostics.Stopwatch]::StartNew()
@@ -856,26 +936,36 @@ foreach ($group in $stages) {
                 [void]$waiting.Remove($s)
             }
         }
+        Update-ErredServers $erred
     }
     foreach ($s in $waiting) {
         Write-Log "$($s.Name): всё ещё отвечает через $StageTimeoutSec с — перехожу к следующей очереди." 'ERROR'
         Add-ServerResult $s Failed "не выключился за $StageTimeoutSec с"
     }
+    Update-ErredServers $erred -Final
 }
 
 # ======================= итог =======================
 
 Write-Log ''
 Write-Log 'Итог:'
-Write-Table ($results | Sort-Object Stage, Index | ForEach-Object {
+$sorted = @($results | Sort-Object Stage, Index)
+Write-Table ($sorted | ForEach-Object {
     [pscustomobject]@{ 'Очередь' = $_.Stage; 'Имя' = $_.Name; 'Адрес' = $_.Address; 'Результат' = $_.Text }
 })
-$off = @($results | Where-Object Kind -eq 'Off').Count
-$skipped = @($results | Where-Object Kind -eq 'Skipped').Count
-$failed = @($results | Where-Object Kind -eq 'Failed')
+$off = @($sorted | Where-Object Kind -eq 'Off').Count
+$skipped = @($sorted | Where-Object Kind -eq 'Skipped').Count
+$lost = @($sorted | Where-Object Kind -eq 'Lost')
+$failed = @($sorted | Where-Object Kind -eq 'Failed')
 $summary = "выключено $off, уже не отвечали $skipped"
+if ($lost.Count) { $summary += ", перестали отвечать после ошибки $($lost.Count): $(($lost | ForEach-Object Name) -join ', ')" }
 if ($failed.Count) {
     Write-Log "Готово с ошибками: $summary, НЕ выключены $($failed.Count): $(($failed | ForEach-Object Name) -join ', '). Подробности — в логе $script:LogFile" 'ERROR'
+    exit 1
+}
+if ($lost.Count) {
+    # код 1: выключение этих серверов не подтверждено
+    Write-Log "Готово с замечаниями: $summary — убедитесь, что они выключены. Подробности — в логе $script:LogFile" 'WARN'
     exit 1
 }
 Write-Log "Готово: $summary." 'OK'

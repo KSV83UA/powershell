@@ -18,8 +18,11 @@
       Список - пакетно из CSV:
         .\New-ServerUsers.ps1 -UserList D:\users.csv
 
-      Без параметров скрипт спрашивает, что делать: диалог или список
-      New-ServerUsers.users.csv рядом со скриптом.
+      Серия - начало логина и количество (student01, student02, ...):
+        .\New-ServerUsers.ps1 -LoginPrefix student -Count 10
+
+      Без параметров скрипт спрашивает, что делать: диалог, список
+      New-ServerUsers.users.csv рядом со скриптом или серию.
 
     Для каждого пользователя скрипт:
       - если логин не задан, составляет его из имени и фамилии латиницей по шаблону
@@ -65,9 +68,26 @@
 
 .PARAMETER Description
     Описание учётной записи (до 48 символов) вместо «отдел, должность».
+    -Department, -Position и -Description подходят и для серии - одно описание всем.
 
 .PARAMETER Password
-    Готовый пароль. Не задан - генерируется.
+    Готовый пароль. Не задан - генерируется. В серии - один пароль на всех.
+
+.PARAMETER LoginPrefix
+    Серия: начало логина, к нему добавляется номер: student -> student01, student02, ...
+
+.PARAMETER Count
+    Серия: сколько пользователей создать, от 1 до 999.
+
+.PARAMETER StartNumber
+    Серия: с какого номера начинать. Не задан - со следующего после самого большого
+    у существующих учётных записей с тем же началом (есть student01-03 -> с student04),
+    то есть создаётся ровно -Count новых. Задан - ровно этот диапазон, уже существующие
+    учётные записи из него не трогаются.
+
+.PARAMETER NumberWidth
+    Серия: сколько цифр в номере, с ведущими нулями. По умолчанию - по последнему номеру,
+    но не меньше двух: 01-10, 001-120.
 
 .PARAMETER Interactive
     Диалог: пользователи вводятся по одному, пока имя не оставят пустым.
@@ -119,6 +139,10 @@
 .EXAMPLE
     .\New-ServerUsers.ps1 temp1 -AccountExpires 2026-12-31 -ExtraGroups 1C_Users
     Временная учётная запись с дополнительной группой.
+
+.EXAMPLE
+    .\New-ServerUsers.ps1 -LoginPrefix student -Count 10 -Department 'Учебный класс' -WhatIf
+    Показывает, какие 10 учётных записей student.. будут созданы, ничего не меняя.
 #>
 [CmdletBinding(SupportsShouldProcess = $true, PositionalBinding = $false)]
 param(
@@ -138,6 +162,15 @@ param(
     # --- диалог или список ---
     [switch]$Interactive,
     [string]$UserList,   # пусто - New-ServerUsers.users.csv рядом со скриптом (см. ниже)
+
+    # --- серия: начало логина и количество ---
+    [string]$LoginPrefix,
+    [ValidateRange(1, 999)]
+    [int]$Count,
+    [ValidateRange(0, 99999)]
+    [int]$StartNumber,
+    [ValidateRange(0, 9)]
+    [int]$NumberWidth,
 
     # --- для всех режимов ---
     [string]$PasswordFile,
@@ -160,9 +193,27 @@ $ErrorActionPreference = 'Stop'
 function Get-ErrorText($ErrorRecord) { $ErrorRecord.Exception.GetBaseException().Message }
 
 # --- Проверка параметров ---
-$singleParams = @(foreach ($name in 'Login', 'FirstName', 'LastName', 'FullName', 'Phone', 'Department', 'Position', 'Description', 'Password') {
+# логин, имя и телефон - только для одного пользователя; описание и пароль - и для серии
+$identityParams = @(foreach ($name in 'Login', 'FirstName', 'LastName', 'FullName', 'Phone') {
         if ($PSBoundParameters.ContainsKey($name)) { $name }
     })
+$detailParams = @(foreach ($name in 'Department', 'Position', 'Description', 'Password') {
+        if ($PSBoundParameters.ContainsKey($name)) { $name }
+    })
+$seriesParams = @(foreach ($name in 'LoginPrefix', 'Count', 'StartNumber', 'NumberWidth') {
+        if ($PSBoundParameters.ContainsKey($name)) { $name }
+    })
+if ($seriesParams.Count -gt 0) {
+    if ($identityParams.Count -gt 0) {
+        throw "Серия (-LoginPrefix, -Count) составляет логины сама: -$($identityParams -join ', -') вместе с ней не указываются."
+    }
+    if ($Interactive -or $UserList) { throw 'Серию (-LoginPrefix, -Count) нельзя указывать вместе с -Interactive или -UserList.' }
+    if (-not "$LoginPrefix".Trim() -or -not $PSBoundParameters.ContainsKey('Count')) {
+        throw 'Для серии нужны оба параметра: -LoginPrefix (начало логина) и -Count (сколько пользователей).'
+    }
+}
+$singleParams = @(if ($seriesParams.Count -eq 0) { $identityParams; $detailParams })
+$seriesStartSet = $PSBoundParameters.ContainsKey('StartNumber')
 if ($singleParams.Count -gt 0 -and ($Interactive -or $UserList)) {
     throw "Параметры одного пользователя (-$($singleParams -join ', -')) нельзя указывать вместе с -Interactive или -UserList."
 }
@@ -225,6 +276,16 @@ function Get-LoginFromName([string]$First, [string]$Last) {
     if ($f -and $l) { return $LoginTemplate.Replace('{first}', $f).Replace('{last}', $l).Replace('{f}', $f.Substring(0, 1)) }
     if ($f) { return $f }
     return $l
+}
+
+# Серия: следующий номер после самого большого у существующих логинов с этим началом
+function Get-SeriesStart([string]$Prefix) {
+    $pattern = '^' + [regex]::Escape($Prefix) + '(\d{1,9})$'
+    $max = 0
+    foreach ($account in @(Get-LocalUser)) {
+        if ($account.Name -match $pattern -and [int]$Matches[1] -gt $max) { $max = [int]$Matches[1] }
+    }
+    $max + 1
 }
 
 function Get-LoginProblem([string]$Name) {
@@ -461,7 +522,9 @@ function Show-UserResult($User, $Result) {
 }
 
 # --- Режим работы ---
+$seriesConfirm = $false
 if ($singleParams.Count -gt 0) { $mode = 'Single' }
+elseif ($seriesParams.Count -gt 0) { $mode = 'Series' }
 elseif ($Interactive) { $mode = 'Interactive' }
 elseif ($UserList) { $mode = 'Batch' }
 elseif ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
@@ -469,9 +532,27 @@ elseif ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
     Write-Host 'Что делаем?'
     Write-Host '  1 - добавить пользователей по одному, с вопросами'
     Write-Host "  2 - добавить всех из списка $defaultUserList$(if (-not (Test-Path -LiteralPath $defaultUserList)) { ' (файла пока нет)' })"
+    Write-Host '  3 - создать серию: начало логина и количество (student01, student02, ...)'
     $answer = "$(Read-Host 'Выбор [1]')".Trim()
     if (-not $answer -or $answer -eq '1') { $mode = 'Interactive' }
     elseif ($answer -eq '2') { $mode = 'Batch' }
+    elseif ($answer -eq '3') {
+        $mode = 'Series'
+        $LoginPrefix = "$(Read-Host 'Начало логина, например student')".Trim()
+        if (-not $LoginPrefix) { throw 'Начало логина не задано.' }
+        $answer = "$(Read-Host 'Сколько пользователей создать')".Trim()
+        if ($answer -notmatch '^\d{1,3}$' -or [int]$answer -lt 1) { throw "Количество - число от 1 до 999, а введено: $answer" }
+        $Count = [int]$answer
+        $autoStart = Get-SeriesStart $LoginPrefix
+        $answer = "$(Read-Host "С какого номера [$autoStart]")".Trim()
+        if ($answer) {
+            if ($answer -notmatch '^\d{1,5}$') { throw "Номер - число от 0 до 99999, а введено: $answer" }
+            $StartNumber = [int]$answer
+            $seriesStartSet = $true
+        }
+        $Description = "$(Read-Host 'Отдел, должность (Enter - пропустить)')".Trim()
+        $seriesConfirm = $true
+    }
     else { throw "Неизвестный выбор: $answer" }
 }
 else { $mode = 'Batch' }   # без консоли (планировщик) - список рядом со скриптом
@@ -523,6 +604,28 @@ if ($mode -eq 'Batch') {
     if ($problems.Count -gt 0) {
         $list = $problems -join "`n  - "
         throw "Список пользователей не прошёл проверку (файл $UserList), никто не создан:`n  - $list"
+    }
+}
+
+# --- Серия: начало логина + номер ---
+if ($mode -eq 'Series') {
+    $LoginPrefix = $LoginPrefix.Trim()
+    $firstNumber = if ($seriesStartSet) { $StartNumber } else { Get-SeriesStart $LoginPrefix }
+    $lastNumber = $firstNumber + $Count - 1
+    $width = if ($NumberWidth) { $NumberWidth } else { [Math]::Max(2, "$lastNumber".Length) }
+    $users = @(for ($i = $firstNumber; $i -le $lastNumber; $i++) {
+            Resolve-UserSpec -Login ($LoginPrefix + "$i".PadLeft($width, '0')) -Description $Description `
+                -Department $Department -Position $Position -Password $Password -Groups $ExtraGroups
+        })
+    $range = if ($users.Count -gt 1) { "$($users[0].Login) ... $($users[-1].Login)" } else { $users[0].Login }
+
+    # у всех логинов серии одна длина и одни символы - одинаковые ошибки показываем один раз
+    $problems = @($users | ForEach-Object { $_.Problems } | Select-Object -Unique)
+    if ($problems) { throw "Серия $range не прошла проверку, никто не создан:`n  - $($problems -join "`n  - ")" }
+
+    if ($seriesConfirm) {
+        $answer = "$(Read-Host "Создать $($users.Count) шт.: $range? (y/n)")".Trim()
+        if ($answer -notmatch '^(y|yes|д|да|т|так)$') { Write-Host 'Отменено, никто не создан.'; return }
     }
 }
 
@@ -580,7 +683,8 @@ switch ($mode) {
         }
     }
 
-    'Batch' {
+    default {
+        # список и серия - уже проверены выше
         foreach ($user in $users) {
             $result = New-UserAccount $user
             $results.Add([pscustomobject]@{ Login = $user.Login; FullName = $user.FullName; Status = $result.Status })
@@ -592,7 +696,7 @@ switch ($mode) {
 # ни одной учётной записи не создано - новый файл с одним заголовком не нужен
 if ($script:passwordFileCreated -and $script:createdCount -eq 0) { [IO.File]::Delete($PasswordFile) }
 
-if ($mode -eq 'Batch' -or $results.Count -gt 1) {
+if ($mode -in 'Batch', 'Series' -or $results.Count -gt 1) {
     Write-Host ''
     $results | Format-Table Login, FullName, Status -AutoSize -Wrap
 }

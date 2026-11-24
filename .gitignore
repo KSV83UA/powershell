@@ -1,7 +1,8 @@
-# Логины и пароли, которые создаёт UserProfileMove/New-ServerUsers.ps1
+# Логины и пароли, которые создаёт AddUsers/New-ServerUsers.ps1
 New-ServerUsers.passwords_*.csv
-# Рабочий список пользователей: настоящие пароли и телефоны, а репозиторий публичный
-UserProfileMove/New-ServerUsers.users.csv
+# Рабочий список пользователей: настоящие пароли и телефоны, а репозиторий публичный.
+# В репозитории - только пример New-ServerUsers.users.example.csv
+New-ServerUsers.users.csv
 # ShutdownServers: настоящее описание инфраструктуры (адреса, логины), учётные данные,
 # ключи SSH серверов и логи — только локально, в репозитории лишь infrastructure.example.psd1
 ShutdownServers/infrastructure.psd1
